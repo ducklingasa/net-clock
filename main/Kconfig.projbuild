@@ -1,0 +1,43 @@
+menu "Network clock"
+
+config CLOCK_WIFI_SSID
+    string "Wi-Fi SSID"
+    default ""
+
+config CLOCK_WIFI_PASSWORD
+    string "Wi-Fi password"
+    default ""
+
+config CLOCK_OPENWEATHERMAP_API_KEY
+    string "OpenWeatherMap API key"
+    default ""
+    help
+        API key used for current weather. Keep sdkconfig local and
+        do not commit it because this value is included in the firmware.
+
+config CLOCK_LATITUDE
+    string "Weather location latitude"
+    default "47.46181"
+    help
+        Latitude in decimal degrees for the OpenWeatherMap request. Use a
+        value from -90 to 90.
+
+config CLOCK_LONGITUDE
+    string "Weather location longitude"
+    default "18.95845"
+    help
+        Longitude in decimal degrees for the OpenWeatherMap request. Use a
+        value from -180 to 180.
+
+config CLOCK_NTP_SERVER
+    string "NTP server"
+    default "pool.ntp.org"
+
+config CLOCK_TIMEZONE
+    string "POSIX timezone"
+    default "CET-1CEST,M3.5.0,M10.5.0/3"
+    help
+        POSIX TZ rule used by localtime(). The default is Central European
+        time with daylight saving rules, as used in Hungary.
+
+endmenu
