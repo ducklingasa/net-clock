@@ -1,6 +1,6 @@
-# ESP32 Network Clock
+# ESP32-S3-Zero Network Clock
 
-A native ESP-IDF clock for an ESP32 with a 240x240 GC9A01 round display. It
+A native ESP-IDF clock for an ESP32-S3-Zero with a 240x240 GC9A01 round display. It
 shows the local date and 24-hour time, along with current temperature,
 humidity, and weather conditions. Time is synchronized over NTP, while weather
 is fetched from OpenWeatherMap over Wi-Fi and HTTPS. The default location and
@@ -29,22 +29,20 @@ OpenWeatherMap API key, and weather location coordinates locally through
 
 ## Hardware
 
-Display pins depend on `ENABLE_SERIAL_LOG` in `main/main.c` (default `0`):
+Connect the display using this pinout. Firmware logging is enabled over the
+ESP32-S3's native USB Serial/JTAG interface; no alternate pinout is needed.
 
-| Display signal | Logging off (default) | Logging on |
-| --- | ---: | ---: |
-| SCK / SCL | 16 | 18 |
-| MOSI / SDA | 17 | 23 |
-| DC | 21 | 26 |
-| CS | 22 | 5 |
-| RST | 3 | 33 |
+| Display signal | ESP32-S3-Zero pin |
+| --- | ---: |
+| SCL | GP1 (GPIO1) |
+| SDA | GP2 (GPIO2) |
+| DC | GP3 (GPIO3) |
+| CS | GP4 (GPIO4) |
+| RST | GP5 (GPIO5) |
 
 The display CS is driven as a GPIO while SPI is configured with hardware chip
-select disabled. With logging off, GPIO3 (the UART0 RX pin) is used for display
-reset to match the seven-pin wiring. By default the ESP-IDF UART console and
-bootloader logs are disabled, so UART serial input and log output are
-unavailable. The ROM may still print its initial boot message before ESP-IDF
-starts.
+select disabled. Connect the ESP32-S3-Zero to the host over USB to view logs
+with `idf.py monitor`.
 
 Power the display's VCC from the board's 5 V pin only if that is supported by
 the display module. The ESP32 GPIO signals are 3.3 V; a 5 V VCC rating does not
@@ -70,12 +68,15 @@ and **Partition Table → Partition Table → Custom partition table CSV**, with
    cd /d path\to\net-clock
    ```
 
-3. Select the ESP32 target and configure the project:
+3. Select the ESP32-S3 target and configure the project:
 
    ```bat
-   idf.py set-target esp32
+   idf.py set-target esp32s3
    idf.py menuconfig
    ```
+
+   Changing the target resets the existing `sdkconfig`; re-enter the Wi-Fi
+   credentials and OpenWeatherMap settings in `menuconfig`.
 
    In `menuconfig`, set **Network clock → Wi-Fi SSID**, **Wi-Fi password**,
    **OpenWeatherMap API key**, and, if needed, **Weather location latitude**
@@ -137,37 +138,18 @@ humidity.
 by Git; do not commit it because Wi-Fi credentials and the weather API key are
 included in the firmware image.
 
-## Serial logging (debugging)
+## Serial logging
 
-Logging is off by default. To enable it:
+Application logs and bootloader info logs use the native USB Serial/JTAG
+console. Connect over USB and run:
 
-1. In `main/main.c`, set `#define ENABLE_SERIAL_LOG 1`. This enables the
-   `ESP_LOGx` calls (display commands, SPI results, Wi-Fi, NTP, per-frame
-   messages) and switches the display to the logging-on pins above, so GPIO3
-   stays free for the console. Rewire the display accordingly.
-2. In `sdkconfig.defaults`, replace the two lines with:
-
-   ```
-   CONFIG_ESP_CONSOLE_UART_DEFAULT=y
-   CONFIG_BOOTLOADER_LOG_LEVEL_INFO=y
-   ```
-
-   An existing `sdkconfig` overrides the defaults file, so delete `sdkconfig`
-   (and re-enter the Wi-Fi and OpenWeatherMap settings in `menuconfig`) or
-   change the console and bootloader log options in `menuconfig` instead.
-3. Build, flash, and watch the output:
-
-   ```bat
-   idf.py -p COM7 build flash monitor
-   ```
-
-To disable logging again, set the flag to `0`, restore
-`CONFIG_ESP_CONSOLE_NONE=y` and `CONFIG_BOOTLOADER_LOG_LEVEL_NONE=y`, and
-rewire the display to the default pins. With the flag at `0`, the log macros
-compile to nothing.
+```bat
+idf.py -p COM7 build flash monitor
+```
 
 ## Notes
 
 - The SPI clock is 40 MHz with `SPI_DEVICE_NO_DUMMY` (the display is
-  write-only). If the picture shows noise or lines, lower `clock_speed_hz` in
-  `display_initialize`; the GC9A01 init sequence is in the same function.
+   write-only). The framebuffer is sent in 32 KiB transactions, the ESP32-S3
+   hardware limit, while chip select remains active for the full frame. The
+   GC9A01 initialization sequence is in `display_initialize`.

@@ -25,33 +25,15 @@
 #include "sdkconfig.h"
 #include "weather_icons.h"
 
-/* Set to 1 to enable serial logging (also set the console/bootloader log in sdkconfig). */
-#define ENABLE_SERIAL_LOG 0
-
-#if ENABLE_SERIAL_LOG
-/* GPIO 3 (UART0 RX) is used by the console, so the reset line moves elsewhere. */
-#define PIN_SCK  18
-#define PIN_MOSI 23
-#define PIN_DC   26
-#define PIN_CS   5
-#define PIN_RST  33
-#else
-#define PIN_SCK  16
-#define PIN_MOSI 17
-#define PIN_DC   21
-#define PIN_CS   22
-#define PIN_RST  3
-
-#undef ESP_LOGE
-#undef ESP_LOGW
-#undef ESP_LOGI
-#define ESP_LOGE(tag, fmt, ...) ((void)(tag), (void)sizeof(printf(fmt, ##__VA_ARGS__)))
-#define ESP_LOGW(tag, fmt, ...) ((void)(tag), (void)sizeof(printf(fmt, ##__VA_ARGS__)))
-#define ESP_LOGI(tag, fmt, ...) ((void)(tag), (void)sizeof(printf(fmt, ##__VA_ARGS__)))
-#endif
+#define PIN_SCL 1
+#define PIN_SDA 2
+#define PIN_DC  3
+#define PIN_CS  4
+#define PIN_RST 5
 
 #define DISPLAY_WIDTH  240
 #define DISPLAY_HEIGHT 240
+#define DISPLAY_SPI_MAX_TRANSFER_BYTES 32768
 #define CENTER_X       120
 #define CENTER_Y       120
 
@@ -124,8 +106,8 @@ static void display_set_window(uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y
 
 static void display_initialize(void)
 {
-    ESP_LOGI(TAG, "Display init: SCK=%d MOSI=%d DC=%d CS=%d RST=%d, %dx%d",
-             PIN_SCK, PIN_MOSI, PIN_DC, PIN_CS, PIN_RST,
+    ESP_LOGI(TAG, "Display init: SCL=%d SDA=%d DC=%d CS=%d RST=%d, %dx%d",
+             PIN_SCL, PIN_SDA, PIN_DC, PIN_CS, PIN_RST,
              DISPLAY_WIDTH, DISPLAY_HEIGHT);
     gpio_config_t output_pins = {
         .pin_bit_mask = (1ULL << PIN_DC) | (1ULL << PIN_CS) | (1ULL << PIN_RST),
@@ -139,12 +121,12 @@ static void display_initialize(void)
     gpio_set_level(PIN_RST, 1);
 
     spi_bus_config_t bus_config = {
-        .mosi_io_num = PIN_MOSI,
+        .mosi_io_num = PIN_SDA,
         .miso_io_num = -1,
-        .sclk_io_num = PIN_SCK,
+        .sclk_io_num = PIN_SCL,
         .quadwp_io_num = -1,
         .quadhd_io_num = -1,
-        .max_transfer_sz = DISPLAY_WIDTH * DISPLAY_HEIGHT * sizeof(uint16_t),
+        .max_transfer_sz = DISPLAY_SPI_MAX_TRANSFER_BYTES,
     };
     ESP_ERROR_CHECK(spi_bus_initialize(SPI2_HOST, &bus_config, SPI_DMA_CH_AUTO));
 
@@ -566,9 +548,15 @@ static void flush_display(void)
     gpio_set_level(PIN_DC, 0);
     gpio_set_level(PIN_CS, 0);
     esp_err_t result = spi_write_selected(false, &memory_write, sizeof(memory_write));
-    if (result == ESP_OK) {
-        result = spi_write_selected(true, framebuffer,
-                                    DISPLAY_WIDTH * DISPLAY_HEIGHT * sizeof(*framebuffer));
+    const uint8_t *pixel_bytes = (const uint8_t *)framebuffer;
+    const size_t frame_size = DISPLAY_WIDTH * DISPLAY_HEIGHT * sizeof(*framebuffer);
+    for (size_t offset = 0; result == ESP_OK && offset < frame_size;) {
+        size_t chunk_size = frame_size - offset;
+        if (chunk_size > DISPLAY_SPI_MAX_TRANSFER_BYTES) {
+            chunk_size = DISPLAY_SPI_MAX_TRANSFER_BYTES;
+        }
+        result = spi_write_selected(true, pixel_bytes + offset, chunk_size);
+        offset += chunk_size;
     }
     gpio_set_level(PIN_CS, 1);
     ESP_LOGI(TAG, "flush_display: %s", esp_err_to_name(result));
