@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Render a sample 240x240 network-clock screen to docs/screen_shot.png."""
+"""Render 240x240 current-weather and forecast clock previews."""
 
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ import math
 import re
 import struct
 import zlib
+from datetime import datetime, timedelta
 from pathlib import Path
 
 
@@ -14,6 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 MAIN_SOURCE = ROOT / "main" / "main.c"
 ICON_HEADER = ROOT / "main" / "weather_icons.h"
 OUTPUT = ROOT / "docs" / "screen_shot.png"
+FORECAST_OUTPUT = ROOT / "docs" / "screen_shot_forecast.png"
 WIDTH = 240
 HEIGHT = 240
 CENTER = 120
@@ -115,6 +117,24 @@ class Screen:
                                     )
             x += 6 * scale
 
+    def forecast_text(self, text: str, x: int, y: int, scale: int,
+                      color: tuple[int, int, int],
+                      font: dict[str, list[int]]) -> None:
+        for character in text:
+            glyph = font.get(character)
+            if glyph is not None:
+                for row in range(7):
+                    for column in range(4):
+                        if glyph[row] & (1 << (3 - column)):
+                            for dy in range(scale):
+                                for dx in range(scale):
+                                    self.pixel(
+                                        x + column * scale + dx,
+                                        y + row * scale + dy,
+                                        color,
+                                    )
+            x += 5 * scale
+
     def png(self) -> bytes:
         rows = bytearray()
         row_size = WIDTH * 3
@@ -154,6 +174,26 @@ def read_font() -> dict[str, list[int]]:
     return dict(zip(characters, glyphs))
 
 
+def read_forecast_font() -> dict[str, list[int]]:
+    source = MAIN_SOURCE.read_text(encoding="ascii")
+    match = re.search(
+        r'static const char forecast_font4x7_characters\[\] = "([^"]+)";\s*'
+        r"static const uint8_t forecast_font4x7\[\]\[7\] = \{(.*?)\n\};",
+        source,
+        re.DOTALL,
+    )
+    if match is None:
+        raise ValueError(f"Could not find the forecast font in {MAIN_SOURCE}")
+    characters, body = match.groups()
+    glyphs = [
+        [int(value, 16) for value in re.findall(r"0x([0-9A-Fa-f]+)", row)]
+        for row in re.findall(r"\{([^{}]+)\}", body)
+    ]
+    if len(glyphs) != len(characters) or any(len(glyph) != 7 for glyph in glyphs):
+        raise ValueError("Forecast font data does not match its declaration")
+    return dict(zip(characters, glyphs))
+
+
 def read_icon(icon_name: str) -> tuple[int, list[int], list[int]]:
     source = ICON_HEADER.read_text(encoding="ascii")
     size_match = re.search(r"#define WEATHER_ICON_SIZE (\d+)", source)
@@ -184,8 +224,38 @@ def read_icon(icon_name: str) -> tuple[int, list[int], list[int]]:
     return int(size_match.group(1)), palette, encoded
 
 
-def draw_icon(screen: Screen, x: int, y: int, icon_name: str) -> None:
+def interpolate_rgb565(
+    top_left: int,
+    top_right: int,
+    bottom_left: int,
+    bottom_right: int,
+    x_weight: float,
+    y_weight: float,
+) -> int:
+    weights = (
+        (1 - x_weight) * (1 - y_weight),
+        x_weight * (1 - y_weight),
+        (1 - x_weight) * y_weight,
+        x_weight * y_weight,
+    )
+    colors = (top_left, top_right, bottom_left, bottom_right)
+    channels = []
+    for shift, mask in ((11, 0x1F), (5, 0x3F), (0, 0x1F)):
+        value = sum(((color >> shift) & mask) * weight
+                    for color, weight in zip(colors, weights))
+        channels.append(math.floor(value + 0.5))
+    return (channels[0] << 11) | (channels[1] << 5) | channels[2]
+
+
+def draw_icon(
+    screen: Screen,
+    x: int,
+    y: int,
+    icon_name: str,
+    output_size: int | None = None,
+) -> None:
     size, palette, encoded = read_icon(icon_name)
+    source_pixels = [0] * (size * size)
     offset = 0
     for row in range(size):
         if offset >= len(encoded):
@@ -208,13 +278,54 @@ def draw_icon(screen: Screen, x: int, y: int, icon_name: str) -> None:
                     )
                 color = palette[color_index - 1]
                 if color:
-                    screen.pixel(x + column, y + row, expand_rgb565(color))
+                    source_pixels[row * size + column] = color
     if offset != len(encoded):
         raise ValueError(f"Icon {icon_name!r} data contains unexpected trailing bytes")
+    output_size = size if output_size is None else output_size
+    for row in range(output_size):
+        source_y = row * (size - 1) / (output_size - 1)
+        y0 = int(source_y)
+        y1 = min(y0 + 1, size - 1)
+        y_weight = source_y - y0
+        for column in range(output_size):
+            source_x = column * (size - 1) / (output_size - 1)
+            x0 = int(source_x)
+            x1 = min(x0 + 1, size - 1)
+            x_weight = source_x - x0
+            color = interpolate_rgb565(
+                source_pixels[y0 * size + x0],
+                source_pixels[y0 * size + x1],
+                source_pixels[y1 * size + x0],
+                source_pixels[y1 * size + x1],
+                x_weight,
+                y_weight,
+            )
+            if color:
+                screen.pixel(x + column, y + row, expand_rgb565(color))
 
 
 def text_width(text: str, scale: int) -> int:
     return 0 if not text else (len(text) * 6 - 1) * scale
+
+
+def forecast_text_width(text: str, scale: int) -> int:
+    return 0 if not text else (len(text) * 5 - 1) * scale
+
+
+def draw_forecast_hour_marker(screen: Screen, tick: int,
+                              color: tuple[int, int, int]) -> None:
+    angle = (tick * 6.0 - 90.0) * math.pi / 180.0
+    dx, dy = math.cos(angle), math.sin(angle)
+    left = CENTER + math.floor(min(101 * dx, 112 * dx)) - 2
+    right = CENTER + math.ceil(max(101 * dx, 112 * dx)) + 2
+    top = CENTER + math.floor(min(101 * dy, 112 * dy)) - 2
+    bottom = CENTER + math.ceil(max(101 * dy, 112 * dy)) + 2
+    for y in range(top, bottom + 1):
+        for x in range(left, right + 1):
+            along = (x - CENTER) * dx + (y - CENTER) * dy
+            across = -(x - CENTER) * dy + (y - CENTER) * dx
+            if 101 <= along <= 112 and abs(across) < 1.5:
+                screen.pixel(x, y, color)
 
 
 def draw_screen(
@@ -322,6 +433,73 @@ def draw_screen(
     return screen
 
 
+def draw_forecast_screen(
+    forecast_time: datetime,
+    forecast_icons: tuple[str, ...],
+) -> Screen:
+    if len(forecast_icons) != 12:
+        raise ValueError("The forecast preview requires 12 hourly icons")
+
+    screen = Screen()
+    font = read_font()
+    forecast_font = read_forecast_font()
+    dial_color = rgb565(90, 90, 100)
+    green = rgb565(0, 255, 30)
+    screen.circle(CENTER, CENTER, 118, dial_color)
+    screen.circle(CENTER, CENTER, 117, dial_color)
+
+    first_hour = forecast_time.replace(minute=0, second=0, microsecond=0)
+    for index, icon_name in enumerate(forecast_icons):
+        forecast_hour = first_hour + timedelta(hours=index)
+        angle = (index * 30.0 - 90.0) * math.pi / 180.0
+        hour_text = forecast_hour.strftime("%H")
+        label_x = CENTER + round(math.cos(angle) * 84)
+        label_y = CENTER + round(math.sin(angle) * 84)
+        screen.text(
+            hour_text,
+            label_x - text_width(hour_text, 1) // 2,
+            label_y - 3,
+            1,
+            rgb565(190, 190, 195),
+            font,
+        )
+
+        icon_angle = (index * 30.0 + 15.0 - 90.0) * math.pi / 180.0
+        icon_x = CENTER + round(math.cos(icon_angle) * 97) - 16
+        icon_y = CENTER + round(math.sin(icon_angle) * 97) - 16
+        draw_icon(screen, icon_x, icon_y, icon_name, output_size=32)
+        draw_forecast_hour_marker(screen, index * 5, green)
+
+    time_text = forecast_time.strftime("%H:%M")
+    weekday_text = forecast_time.strftime("%a").upper()
+    date_text = forecast_time.strftime("%d %b").upper()
+    time_scale = 6
+    time_x = (WIDTH - forecast_text_width(time_text, time_scale)) // 2
+    time_y = (HEIGHT - 7 * time_scale) // 2
+    date_scale = 3
+    date_gap = 12
+    screen.text(
+        weekday_text,
+        (WIDTH - text_width(weekday_text, date_scale)) // 2,
+        time_y - 7 * date_scale - date_gap,
+        date_scale,
+        rgb565(0, 225, 240),
+        font,
+    )
+    screen.forecast_text(
+        time_text, time_x, time_y, time_scale, rgb565(255, 255, 255), forecast_font
+    )
+    screen.text(
+        date_text,
+        (WIDTH - text_width(date_text, date_scale)) // 2,
+        time_y + 7 * time_scale + date_gap,
+        date_scale,
+        rgb565(0, 225, 240),
+        font,
+    )
+    return screen
+
+
 def main(
     date_text: str,
     time_text: str,
@@ -331,6 +509,13 @@ def main(
     humidity: int,
     output: Path = OUTPUT,
     colon_white: bool = True,
+    forecast_time: datetime = datetime(2026, 11, 11, 13, 25),
+    forecast_icons: tuple[str, ...] = (
+        "few_day", "few_day", "scattered_day", "broken_day", "rain_day",
+        "sunset", "clear_night", "few_night", "few_night", "clear_night",
+        "clear_night", "clear_night",
+    ),
+    forecast_output: Path = FORECAST_OUTPUT,
 ) -> None:
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_bytes(
@@ -344,6 +529,13 @@ def main(
     except ValueError:
         location = output
     print(f"Wrote {location}")
+    forecast_output.parent.mkdir(parents=True, exist_ok=True)
+    forecast_output.write_bytes(draw_forecast_screen(forecast_time, forecast_icons).png())
+    try:
+        location = forecast_output.relative_to(ROOT)
+    except ValueError:
+        location = forecast_output
+    print(f"Wrote {location}")
 
 
 if __name__ == "__main__":
@@ -354,4 +546,10 @@ if __name__ == "__main__":
         temperature=15,
         weather_icon="few_day",
         humidity=65,
+        forecast_time=datetime(2026, 11, 11, 13, 25),
+        forecast_icons=(
+            "few_day", "few_day", "scattered_day", "broken_day", "rain_day",
+            "sunset", "clear_night", "few_night", "few_night", "clear_night",
+            "clear_night", "clear_night",
+        ),
     )

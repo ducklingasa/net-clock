@@ -12,8 +12,10 @@ config CLOCK_OPENWEATHERMAP_API_KEY
     string "OpenWeatherMap API key"
     default ""
     help
-        API key used for current weather. Keep sdkconfig local and
-        do not commit it because this value is included in the firmware.
+        API key used for current conditions and forecasts. One Call 3.0 is
+        preferred; the firmware falls back to the 2.5 current and forecast
+        endpoints. Keep sdkconfig local and do not commit it because this
+        value is included in the firmware.
 
 config CLOCK_LATITUDE
     string "Weather location latitude"

@@ -2,15 +2,18 @@
 
 A native ESP-IDF clock for an ESP32-S3-Zero with a 240x240 GC9A01 round display. It
 shows the local date and 24-hour time, along with current temperature,
-humidity, and weather conditions. Time is synchronized over NTP, while weather
-is fetched from OpenWeatherMap over Wi-Fi and HTTPS. The default location and
-timezone are set for Budaors, Hungary. Configure Wi-Fi credentials, the
-OpenWeatherMap API key, and weather location coordinates locally through
-`menuconfig`.
+humidity, and weather conditions. Tap the BOOT button (GPIO0) to switch to a
+forecast face with 12 hours arranged around the dial. Time is synchronized over
+NTP, while weather is fetched from OpenWeatherMap over Wi-Fi and HTTPS. The
+default location and timezone are set for Budaors, Hungary. Configure Wi-Fi
+credentials, the OpenWeatherMap API key, and weather location coordinates
+locally through `menuconfig`.
 
 ## Preview
 
-![Network clock display showing the time and weather](docs/screen_shot.png)
+| Weather | Forecast |
+| --- | --- |
+| ![Weather clock face](docs/screen_shot.png) | ![Forecast clock face](docs/screen_shot_forecast.png) |
 
 ### Weather icons
 
@@ -124,15 +127,21 @@ timestamps; missing event times leave the normal icon visible. Absolute
 timestamps keep the window correct across timezone and daylight-saving
 changes.
 
+The forecast face uses OpenWeatherMap One Call 3.0 for current conditions and
+hourly forecasts. If that endpoint is unavailable, the firmware falls back to
+the 2.5 current-weather and forecast endpoints; forecast icons then advance in
+three-hour steps. Tap BOOT (GPIO0) again to return to the current-conditions
+face.
+
 Weather symbols are RGB565 display assets based on the OpenWeatherMap-compatible
 day/night SVGs archived in `docs/orig/`, including sunrise and sunset.
 To export the exact packed icons used by the firmware as transparent PNGs in
 `docs/`, run `python tools\render_weather_icons.py`. The renderer reads
 `main/weather_icons.h` and uses only the Python standard library.
-To render the sample 240x240 screen to `docs/screen_shot.png`, run
-`python tools\render_screen_shot.py`. Edit the parameters in the script's
-`main()` call to change the date, time, seconds, temperature, weather icon, or
-humidity.
+To render the sample 240x240 screens to `docs/screen_shot.png` and
+`docs/screen_shot_forecast.png`, run `python tools\render_screen_shot.py`. Edit
+the `main()` call parameters to change either screen, including the forecast
+datetime and its 12 hourly icon names.
 
 `menuconfig` stores credentials in the local `sdkconfig` file. It is ignored
 by Git; do not commit it because Wi-Fi credentials and the weather API key are

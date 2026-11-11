@@ -21,6 +21,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
 #include "freertos/task.h"
+#include "nvs.h"
 #include "nvs_flash.h"
 #include "sdkconfig.h"
 #include "weather_icons.h"
@@ -30,6 +31,7 @@
 #define PIN_DC  3
 #define PIN_CS  4
 #define PIN_RST 5
+#define PIN_BOOT 0
 
 #define DISPLAY_WIDTH  240
 #define DISPLAY_HEIGHT 240
@@ -42,7 +44,15 @@
 #define WIFI_MAX_RETRIES   10
 #define WEATHER_REFRESH_SECONDS (10 * 60)
 #define WEATHER_RETRY_SECONDS   60
-#define WEATHER_RESPONSE_MAX    2048
+#define WEATHER_RESPONSE_MAX    (32 * 1024)
+#define WEATHER_FORECAST_HOURS  12
+#define ONE_CALL_DAILY_LIMIT    500
+#define CLOCK_STATE_NVS_NAMESPACE "clock_state"
+#define CLOCK_STATE_NVS_KEY       "forecast_face"
+#define CURRENT_ICON_CACHE_CAPACITY 3
+#define WEATHER_ICON_PIXELS (WEATHER_ICON_SIZE * WEATHER_ICON_SIZE)
+#define FORECAST_ICON_SIZE 32
+#define FORECAST_ICON_PIXELS (FORECAST_ICON_SIZE * FORECAST_ICON_SIZE)
 
 #define RGB565(r, g, b) \
     (uint16_t)((((r) & 0xF8) << 8) | (((g) & 0xFC) << 3) | ((b) >> 3))
@@ -53,6 +63,7 @@ static const uint16_t DIAL_COLOR = RGB565(90, 90, 100);
 static const uint16_t MIN_COLOR = RGB565(0, 225, 240);
 static const uint16_t SECOND_COLOR = RGB565(255, 255, 255);
 static const uint16_t FIVE_SECOND_COLOR = RGB565(0, 255, 30);
+static const uint16_t FORECAST_HOUR_COLOR = RGB565(190, 190, 195);
 
 typedef struct {
     int temperature;
@@ -63,12 +74,42 @@ typedef struct {
     bool valid;
 } weather_reading_t;
 
+typedef struct {
+    time_t timestamp;
+    char icon[4];
+    bool solar_event;
+    bool sunrise_event;
+} forecast_hour_t;
+
+typedef struct {
+    weather_reading_t current;
+    forecast_hour_t hours[WEATHER_FORECAST_HOURS];
+    uint8_t hour_count;
+    uint32_t generation;
+} weather_snapshot_t;
+
+typedef struct {
+    const weather_icon_t *icon;
+    uint16_t decoded[WEATHER_ICON_PIXELS];
+} decoded_weather_icon_t;
+
+typedef struct {
+    const weather_icon_t *icon;
+    uint16_t scaled[FORECAST_ICON_PIXELS];
+} forecast_weather_icon_t;
+
 static spi_device_handle_t display_spi;
 static uint16_t *framebuffer;
 static EventGroupHandle_t wifi_event_group;
 static int wifi_retry_count;
-static weather_reading_t current_weather;
+static weather_snapshot_t current_weather;
 static portMUX_TYPE weather_mux = portMUX_INITIALIZER_UNLOCKED;
+static decoded_weather_icon_t current_icon_cache[CURRENT_ICON_CACHE_CAPACITY];
+static size_t current_icon_cache_count;
+static forecast_weather_icon_t forecast_icon_cache[WEATHER_FORECAST_HOURS];
+static size_t forecast_icon_cache_count;
+static uint16_t weather_icon_decode_scratch[WEATHER_ICON_PIXELS];
+static uint32_t weather_icon_cache_generation = UINT32_MAX;
 
 static esp_err_t spi_write_selected(bool data_mode, const void *data, size_t length)
 {
@@ -345,6 +386,47 @@ static void draw_text(const char *text, int x, int y, int scale, uint16_t color)
     }
 }
 
+static const char forecast_font4x7_characters[] = "0123456789:";
+static const uint8_t forecast_font4x7[][7] = {
+    {0x6, 0x9, 0x9, 0x9, 0x9, 0x9, 0x6},
+    {0x2, 0x6, 0x2, 0x2, 0x2, 0x2, 0x7},
+    {0x6, 0x9, 0x1, 0x2, 0x4, 0x8, 0xF},
+    {0xE, 0x1, 0x1, 0x6, 0x1, 0x1, 0xE},
+    {0x9, 0x9, 0x9, 0xF, 0x1, 0x1, 0x1},
+    {0xF, 0x8, 0x8, 0xE, 0x1, 0x9, 0x6},
+    {0x7, 0x8, 0x8, 0xE, 0x9, 0x9, 0x6},
+    {0xF, 0x1, 0x2, 0x2, 0x4, 0x4, 0x4},
+    {0x6, 0x9, 0x9, 0x6, 0x9, 0x9, 0x6},
+    {0x6, 0x9, 0x9, 0x7, 0x1, 0x1, 0xE},
+    {0x0, 0x6, 0x6, 0x0, 0x6, 0x6, 0x0},
+};
+
+static int forecast_time_text_width(const char *text, int scale)
+{
+    const size_t length = strlen(text);
+    return length == 0 ? 0 : (int)(length * 5 - 1) * scale;
+}
+
+static void draw_forecast_time_text(const char *text, int x, int y, int scale,
+                                    uint16_t color)
+{
+    for (; *text != '\0'; ++text, x += 5 * scale) {
+        const char *match = strchr(forecast_font4x7_characters, *text);
+        if (match == NULL) {
+            continue;
+        }
+        const uint8_t *glyph = forecast_font4x7[match - forecast_font4x7_characters];
+        for (int row = 0; row < 7; ++row) {
+            for (int column = 0; column < 4; ++column) {
+                if (glyph[row] & (1U << (3 - column))) {
+                    fill_rectangle(x + column * scale, y + row * scale,
+                                   scale, scale, color);
+                }
+            }
+        }
+    }
+}
+
 static const weather_icon_t *weather_icon_for_code(const char *code)
 {
     const bool is_day = code[2] == 'd';
@@ -394,11 +476,20 @@ static const weather_icon_t *weather_icon_for_reading(const weather_reading_t *w
     return weather_icon_for_code(weather->icon);
 }
 
-static void draw_weather_icon(const weather_icon_t *icon, int x, int y)
+static const weather_icon_t *weather_icon_for_forecast(const forecast_hour_t *forecast)
+{
+    if (forecast->solar_event) {
+        return forecast->sunrise_event ? &weather_icon_sunrise : &weather_icon_sunset;
+    }
+    return weather_icon_for_code(forecast->icon);
+}
+
+static void decode_weather_icon(const weather_icon_t *icon, uint16_t *pixels)
 {
     if (icon == NULL) {
         return;
     }
+    memset(pixels, 0, WEATHER_ICON_PIXELS * sizeof(*pixels));
     const uint8_t *encoded = icon->rle;
     for (int row = 0; row < WEATHER_ICON_SIZE; ++row) {
         const uint8_t span_count = *encoded++;
@@ -407,8 +498,160 @@ static void draw_weather_icon(const weather_icon_t *icon, int x, int y)
             const uint8_t length = *encoded++;
             for (uint8_t offset = 0; offset < length; ++offset) {
                 const uint8_t color_index = *encoded++;
-                const uint16_t color = weather_icon_palette[color_index - 1];
-                set_pixel(x + start + offset, y + row, color);
+                if (color_index != 0 && start + offset < WEATHER_ICON_SIZE) {
+                    pixels[row * WEATHER_ICON_SIZE + start + offset] =
+                        weather_icon_palette[color_index - 1];
+                }
+            }
+        }
+    }
+}
+
+static uint16_t interpolate_rgb565(uint16_t top_left, uint16_t top_right,
+                                   uint16_t bottom_left, uint16_t bottom_right,
+                                   float x_weight, float y_weight)
+{
+    const float top_left_weight = (1.0f - x_weight) * (1.0f - y_weight);
+    const float top_right_weight = x_weight * (1.0f - y_weight);
+    const float bottom_left_weight = (1.0f - x_weight) * y_weight;
+    const float bottom_right_weight = x_weight * y_weight;
+    const int red = (int)lroundf(((top_left >> 11) & 0x1F) * top_left_weight +
+                                 ((top_right >> 11) & 0x1F) * top_right_weight +
+                                 ((bottom_left >> 11) & 0x1F) * bottom_left_weight +
+                                 ((bottom_right >> 11) & 0x1F) * bottom_right_weight);
+    const int green = (int)lroundf(((top_left >> 5) & 0x3F) * top_left_weight +
+                                   ((top_right >> 5) & 0x3F) * top_right_weight +
+                                   ((bottom_left >> 5) & 0x3F) * bottom_left_weight +
+                                   ((bottom_right >> 5) & 0x3F) * bottom_right_weight);
+    const int blue = (int)lroundf((top_left & 0x1F) * top_left_weight +
+                                  (top_right & 0x1F) * top_right_weight +
+                                  (bottom_left & 0x1F) * bottom_left_weight +
+                                  (bottom_right & 0x1F) * bottom_right_weight);
+    return (uint16_t)((red << 11) | (green << 5) | blue);
+}
+
+static void scale_weather_icon(const uint16_t *source, uint16_t *destination)
+{
+    for (int y = 0; y < FORECAST_ICON_SIZE; ++y) {
+        const float source_y = (float)y * (WEATHER_ICON_SIZE - 1) /
+                               (FORECAST_ICON_SIZE - 1);
+        const int y0 = (int)source_y;
+        const int y1 = y0 < WEATHER_ICON_SIZE - 1 ? y0 + 1 : y0;
+        const float y_weight = source_y - y0;
+        for (int x = 0; x < FORECAST_ICON_SIZE; ++x) {
+            const float source_x = (float)x * (WEATHER_ICON_SIZE - 1) /
+                                   (FORECAST_ICON_SIZE - 1);
+            const int x0 = (int)source_x;
+            const int x1 = x0 < WEATHER_ICON_SIZE - 1 ? x0 + 1 : x0;
+            const float x_weight = source_x - x0;
+            destination[y * FORECAST_ICON_SIZE + x] = interpolate_rgb565(
+                source[y0 * WEATHER_ICON_SIZE + x0],
+                source[y0 * WEATHER_ICON_SIZE + x1],
+                source[y1 * WEATHER_ICON_SIZE + x0],
+                source[y1 * WEATHER_ICON_SIZE + x1], x_weight, y_weight);
+        }
+    }
+}
+
+static decoded_weather_icon_t *find_cached_current_icon(const weather_icon_t *icon)
+{
+    if (icon == NULL) {
+        return NULL;
+    }
+    for (size_t index = 0; index < current_icon_cache_count; ++index) {
+        if (current_icon_cache[index].icon == icon) {
+            return &current_icon_cache[index];
+        }
+    }
+    return NULL;
+}
+
+static forecast_weather_icon_t *find_cached_forecast_icon(const weather_icon_t *icon)
+{
+    if (icon == NULL) {
+        return NULL;
+    }
+    for (size_t index = 0; index < forecast_icon_cache_count; ++index) {
+        if (forecast_icon_cache[index].icon == icon) {
+            return &forecast_icon_cache[index];
+        }
+    }
+    return NULL;
+}
+
+static void cache_current_icon(const weather_icon_t *icon)
+{
+    if (icon == NULL || find_cached_current_icon(icon) != NULL ||
+        current_icon_cache_count >= CURRENT_ICON_CACHE_CAPACITY) {
+        return;
+    }
+    decoded_weather_icon_t *bitmap = &current_icon_cache[current_icon_cache_count++];
+    bitmap->icon = icon;
+    decode_weather_icon(icon, bitmap->decoded);
+}
+
+static void cache_forecast_icon(const weather_icon_t *icon)
+{
+    if (icon == NULL || find_cached_forecast_icon(icon) != NULL ||
+        forecast_icon_cache_count >= WEATHER_FORECAST_HOURS) {
+        return;
+    }
+    forecast_weather_icon_t *bitmap = &forecast_icon_cache[forecast_icon_cache_count++];
+    bitmap->icon = icon;
+    decoded_weather_icon_t *current_bitmap = find_cached_current_icon(icon);
+    const uint16_t *source = weather_icon_decode_scratch;
+    if (current_bitmap != NULL) {
+        source = current_bitmap->decoded;
+    } else {
+        decode_weather_icon(icon, weather_icon_decode_scratch);
+    }
+    scale_weather_icon(source, bitmap->scaled);
+}
+
+static void rebuild_weather_icon_cache(const weather_snapshot_t *weather)
+{
+    current_icon_cache_count = 0;
+    forecast_icon_cache_count = 0;
+    if (weather->current.valid) {
+        cache_current_icon(weather_icon_for_code(weather->current.icon));
+        const bool clear_or_few = strncmp(weather->current.icon, "01", 2) == 0 ||
+                                  strncmp(weather->current.icon, "02", 2) == 0;
+        if (clear_or_few && weather->current.sunrise > 0) {
+            cache_current_icon(&weather_icon_sunrise);
+        }
+        if (clear_or_few && weather->current.sunset > 0) {
+            cache_current_icon(&weather_icon_sunset);
+        }
+    }
+    for (uint8_t index = 0; index < weather->hour_count; ++index) {
+        cache_forecast_icon(weather_icon_for_forecast(&weather->hours[index]));
+    }
+    weather_icon_cache_generation = weather->generation;
+}
+
+static void draw_cached_weather_icon(const weather_icon_t *icon, int x, int y,
+                                     bool forecast_size)
+{
+    const int size = forecast_size ? FORECAST_ICON_SIZE : WEATHER_ICON_SIZE;
+    const uint16_t *pixels;
+    if (forecast_size) {
+        forecast_weather_icon_t *bitmap = find_cached_forecast_icon(icon);
+        if (bitmap == NULL) {
+            return;
+        }
+        pixels = bitmap->scaled;
+    } else {
+        decoded_weather_icon_t *bitmap = find_cached_current_icon(icon);
+        if (bitmap == NULL) {
+            return;
+        }
+        pixels = bitmap->decoded;
+    }
+    for (int row = 0; row < size; ++row) {
+        for (int column = 0; column < size; ++column) {
+            const uint16_t color = pixels[row * size + column];
+            if (color != 0) {
+                set_pixel(x + column, y + row, color);
             }
         }
     }
@@ -468,77 +711,153 @@ static void draw_minute_marker(int tick, uint16_t color, int thickness)
     }
 }
 
-static void draw_clock_face(const struct tm *time_info, const weather_reading_t *weather,
-                            time_t now, bool colon_white)
+static void draw_forecast_tick(int index)
+{
+    draw_hour_marker(index * 5, FIVE_SECOND_COLOR);
+}
+
+static void draw_clock_face(const struct tm *time_info, const weather_snapshot_t *weather,
+                            time_t now, bool colon_white, bool forecast_face)
 {
     memset(framebuffer, 0, DISPLAY_WIDTH * DISPLAY_HEIGHT * sizeof(*framebuffer));
     draw_circle(CENTER_X, CENTER_Y, 118, DIAL_COLOR);
     draw_circle(CENTER_X, CENTER_Y, 117, DIAL_COLOR);
 
-    for (int tick = 0; tick < 60; ++tick) {
-        const bool major = tick % 5 == 0;
-        const bool elapsed = time_info != NULL &&
-            (time_info->tm_sec == 0 || (tick > 0 && tick <= time_info->tm_sec));
-        const uint16_t color = elapsed
-            ? (major ? FIVE_SECOND_COLOR : SECOND_COLOR)
-            : DIAL_COLOR;
-        if (major) {
-            draw_hour_marker(tick, color);
-            continue;
+    if (forecast_face) {
+        if (weather != NULL) {
+            for (uint8_t index = 0; index < weather->hour_count; ++index) {
+                const float angle = (index * 30.0f - 90.0f) *
+                                    3.14159265f / 180.0f;
+                struct tm forecast_time;
+                if (localtime_r(&weather->hours[index].timestamp, &forecast_time) != NULL) {
+                    char hour_text[3];
+                    snprintf(hour_text, sizeof(hour_text), "%02d", forecast_time.tm_hour);
+                    const int label_center_x = CENTER_X +
+                        (int)lroundf(cosf(angle) * 84);
+                    const int label_center_y = CENTER_Y +
+                        (int)lroundf(sinf(angle) * 84);
+                    draw_text(hour_text,
+                              label_center_x - text_width(hour_text, 1) / 2,
+                              label_center_y - 3, 1, FORECAST_HOUR_COLOR);
+                }
+                const float icon_angle = (index * 30.0f + 15.0f - 90.0f) *
+                                         3.14159265f / 180.0f;
+                const int icon_center_x = CENTER_X + (int)lroundf(cosf(icon_angle) * 97);
+                const int icon_center_y = CENTER_Y + (int)lroundf(sinf(icon_angle) * 97);
+                draw_cached_weather_icon(
+                    weather_icon_for_forecast(&weather->hours[index]),
+                    icon_center_x - FORECAST_ICON_SIZE / 2,
+                    icon_center_y - FORECAST_ICON_SIZE / 2, true);
+                draw_forecast_tick(index);
+            }
         }
-        draw_minute_marker(tick, color, elapsed ? 3 : 1);
+    } else {
+        for (int tick = 0; tick < 60; ++tick) {
+            const bool major = tick % 5 == 0;
+            const bool elapsed = time_info != NULL &&
+                (time_info->tm_sec == 0 || (tick > 0 && tick <= time_info->tm_sec));
+            const uint16_t color = elapsed
+                ? (major ? FIVE_SECOND_COLOR : SECOND_COLOR)
+                : DIAL_COLOR;
+            if (major) {
+                draw_hour_marker(tick, color);
+                continue;
+            }
+            draw_minute_marker(tick, color, elapsed ? 3 : 1);
+        }
     }
 
     if (time_info != NULL) {
-        char date_text[16];
         char time_text[6];
-        strftime(date_text, sizeof(date_text), "%a %d", time_info);
         strftime(time_text, sizeof(time_text), "%H:%M", time_info);
-        for (char *character = date_text; *character != '\0'; ++character) {
-            if (*character >= 'a' && *character <= 'z') {
-                *character = (char)(*character - 'a' + 'A');
+        if (forecast_face) {
+            const int scale = 6;
+            const int time_x =
+                (DISPLAY_WIDTH - forecast_time_text_width(time_text, scale)) / 2;
+            const int time_y = (DISPLAY_HEIGHT - 7 * scale) / 2;
+            const int date_scale = 3;
+            const int date_gap = 12;
+            char weekday_text[4];
+            char date_text[8];
+            strftime(weekday_text, sizeof(weekday_text), "%a", time_info);
+            strftime(date_text, sizeof(date_text), "%d %b", time_info);
+            for (char *character = weekday_text; *character != '\0'; ++character) {
+                if (*character >= 'a' && *character <= 'z') {
+                    *character = (char)(*character - 'a' + 'A');
+                }
+            }
+            for (char *character = date_text; *character != '\0'; ++character) {
+                if (*character >= 'a' && *character <= 'z') {
+                    *character = (char)(*character - 'a' + 'A');
+                }
+            }
+            draw_text(weekday_text,
+                      (DISPLAY_WIDTH - text_width(weekday_text, date_scale)) / 2,
+                      time_y - 7 * date_scale - date_gap, date_scale, MIN_COLOR);
+            draw_forecast_time_text(time_text, time_x, time_y, scale,
+                                    RGB565(255, 255, 255));
+            if (!colon_white) {
+                const int colon_x = time_x + 2 * 5 * scale;
+                draw_forecast_time_text(":", colon_x, time_y, scale, DIAL_COLOR);
+            }
+            draw_text(date_text,
+                      (DISPLAY_WIDTH - text_width(date_text, date_scale)) / 2,
+                      time_y + 7 * scale + date_gap, date_scale, MIN_COLOR);
+        } else {
+            char date_text[16];
+            strftime(date_text, sizeof(date_text), "%a %d", time_info);
+            for (char *character = date_text; *character != '\0'; ++character) {
+                if (*character >= 'a' && *character <= 'z') {
+                    *character = (char)(*character - 'a' + 'A');
+                }
+            }
+            draw_text(date_text, (DISPLAY_WIDTH - text_width(date_text, 3)) / 2,
+                      43, 3, MIN_COLOR);
+            draw_text(time_text, (DISPLAY_WIDTH - text_width(time_text, 6)) / 2,
+                      78, 6, RGB565(255, 255, 255));
+            if (!colon_white) {
+                const int colon_x = (DISPLAY_WIDTH - text_width(time_text, 6)) / 2 +
+                                    2 * 6 * 6;
+                draw_text(":", colon_x, 78, 6, DIAL_COLOR);
             }
         }
-        draw_text(date_text, (DISPLAY_WIDTH - text_width(date_text, 3)) / 2,
-                  43, 3, MIN_COLOR);
-        draw_text(time_text, (DISPLAY_WIDTH - text_width(time_text, 6)) / 2,
-                  78, 6, RGB565(255, 255, 255));
-        if (!colon_white) {
-            const int colon_x = (DISPLAY_WIDTH - text_width(time_text, 6)) / 2 + 2 * 6 * 6;
-            draw_text(":", colon_x, 78, 6, DIAL_COLOR);
+    }
+
+    if (weather != NULL && weather->current.valid && !forecast_face) {
+        draw_cached_weather_icon(
+            weather_icon_for_reading(&weather->current, now), 54, 128, false);
+    }
+
+    if (!forecast_face) {
+        char temperature_text[8];
+        char humidity_text[8];
+        if (weather != NULL && weather->current.valid) {
+            snprintf(temperature_text, sizeof(temperature_text), "%d",
+                     weather->current.temperature);
+            snprintf(humidity_text, sizeof(humidity_text), "%d%%",
+                     weather->current.humidity);
+        } else {
+            strlcpy(temperature_text, "--", sizeof(temperature_text));
+            strlcpy(humidity_text, "--%", sizeof(humidity_text));
         }
-    }
+        const int temperature_scale = strlen(temperature_text) > 3 ? 3 : 4;
+        const int temperature_x = 119;
+        const int temperature_y = 139;
+        const int temperature_width = text_width(temperature_text, temperature_scale);
+        draw_text(temperature_text, temperature_x, temperature_y, temperature_scale,
+                  RGB565(255, 20, 20));
+        const int degree_x = temperature_x + temperature_width + 5;
+        fill_circle(degree_x, temperature_y + 4, 4, RGB565(255, 20, 20));
+        fill_circle(degree_x, temperature_y + 4, 2, RGB565(0, 0, 0));
+        draw_text("C", degree_x + 8, temperature_y + 7, 3, RGB565(255, 20, 20));
 
-    if (weather != NULL && weather->valid) {
-        draw_weather_icon(weather_icon_for_reading(weather, now), 54, 128);
+        const int humidity_scale = 3;
+        const int humidity_width = text_width(humidity_text, humidity_scale);
+        const int humidity_start = (DISPLAY_WIDTH - (humidity_width + 27)) / 2;
+        draw_droplet(humidity_start + 9, 180, RGB565(0, 90, 255));
+        draw_text(humidity_text, humidity_start + 27, 183, humidity_scale,
+                  RGB565(0, 90, 255));
     }
-
-    char temperature_text[8];
-    char humidity_text[8];
-    if (weather != NULL && weather->valid) {
-        snprintf(temperature_text, sizeof(temperature_text), "%d", weather->temperature);
-        snprintf(humidity_text, sizeof(humidity_text), "%d%%", weather->humidity);
-    } else {
-        strlcpy(temperature_text, "--", sizeof(temperature_text));
-        strlcpy(humidity_text, "--%", sizeof(humidity_text));
-    }
-    const int temperature_scale = strlen(temperature_text) > 3 ? 3 : 4;
-    const int temperature_x = 119;
-    const int temperature_y = 139;
-    const int temperature_width = text_width(temperature_text, temperature_scale);
-    draw_text(temperature_text, temperature_x, temperature_y, temperature_scale,
-              RGB565(255, 20, 20));
-    const int degree_x = temperature_x + temperature_width + 5;
-    fill_circle(degree_x, temperature_y + 4, 4, RGB565(255, 20, 20));
-    fill_circle(degree_x, temperature_y + 4, 2, RGB565(0, 0, 0));
-    draw_text("C", degree_x + 8, temperature_y + 7, 3, RGB565(255, 20, 20));
-
-    const int humidity_scale = 3;
-    const int humidity_width = text_width(humidity_text, humidity_scale);
-    const int humidity_start = (DISPLAY_WIDTH - (humidity_width + 27)) / 2;
-    draw_droplet(humidity_start + 9, 180, RGB565(0, 90, 255));
-    draw_text(humidity_text, humidity_start + 27, 183, humidity_scale,
-              RGB565(0, 90, 255));
 }
 
 static void flush_display(void)
@@ -631,8 +950,9 @@ static esp_err_t connect_wifi(void)
 }
 
 typedef struct {
-    char body[WEATHER_RESPONSE_MAX];
+    char *body;
     size_t length;
+    size_t capacity;
 } weather_http_response_t;
 
 static esp_err_t weather_http_event(esp_http_client_event_t *event)
@@ -643,9 +963,10 @@ static esp_err_t weather_http_event(esp_http_client_event_t *event)
 
     weather_http_response_t *response = event->user_data;
     const size_t data_length = (size_t)event->data_len;
-    if (data_length >= sizeof(response->body) - response->length) {
+    if (response->length >= response->capacity ||
+        data_length > response->capacity - response->length - 1) {
         ESP_LOGE(TAG, "OpenWeatherMap response exceeds %u bytes",
-                 (unsigned)sizeof(response->body) - 1);
+                 (unsigned)response->capacity - 1);
         return ESP_ERR_INVALID_SIZE;
     }
     memcpy(response->body + response->length, event->data, data_length);
@@ -654,25 +975,17 @@ static esp_err_t weather_http_event(esp_http_client_event_t *event)
     return ESP_OK;
 }
 
-static esp_err_t fetch_weather(weather_reading_t *reading)
+static esp_err_t weather_http_get(const char *url, cJSON **root)
 {
-    if (CONFIG_CLOCK_OPENWEATHERMAP_API_KEY[0] == '\0') {
-        ESP_LOGE(TAG, "Set the OpenWeatherMap API key in menuconfig");
-        return ESP_ERR_INVALID_ARG;
+    *root = NULL;
+    weather_http_response_t response = {
+        .body = heap_caps_calloc(1, WEATHER_RESPONSE_MAX,
+                                 MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT),
+        .capacity = WEATHER_RESPONSE_MAX,
+    };
+    if (response.body == NULL) {
+        return ESP_ERR_NO_MEM;
     }
-
-    char url[384];
-    const int url_length = snprintf(
-        url, sizeof(url),
-        "https://api.openweathermap.org/data/2.5/weather?lat=%s&lon=%s&units=metric&appid=%s",
-        CONFIG_CLOCK_LATITUDE, CONFIG_CLOCK_LONGITUDE,
-        CONFIG_CLOCK_OPENWEATHERMAP_API_KEY);
-    if (url_length < 0 || (size_t)url_length >= sizeof(url)) {
-        ESP_LOGE(TAG, "OpenWeatherMap request URL exceeds its configured buffer");
-        return ESP_ERR_INVALID_SIZE;
-    }
-
-    weather_http_response_t response = {0};
     esp_http_client_config_t configuration = {
         .url = url,
         .event_handler = weather_http_event,
@@ -682,6 +995,7 @@ static esp_err_t fetch_weather(weather_reading_t *reading)
     };
     esp_http_client_handle_t client = esp_http_client_init(&configuration);
     if (client == NULL) {
+        free(response.body);
         ESP_LOGE(TAG, "Could not initialize the OpenWeatherMap HTTP client");
         return ESP_ERR_NO_MEM;
     }
@@ -690,37 +1004,82 @@ static esp_err_t fetch_weather(weather_reading_t *reading)
     const int status_code = esp_http_client_get_status_code(client);
     esp_http_client_cleanup(client);
     if (result != ESP_OK) {
+        free(response.body);
         ESP_LOGE(TAG, "OpenWeatherMap request failed: %s", esp_err_to_name(result));
         return result;
     }
     if (status_code < 200 || status_code >= 300) {
+        free(response.body);
         ESP_LOGE(TAG, "OpenWeatherMap returned HTTP status %d", status_code);
         return ESP_FAIL;
     }
 
-    cJSON *root = cJSON_Parse(response.body);
-    if (root == NULL) {
+    *root = cJSON_Parse(response.body);
+    free(response.body);
+    if (*root == NULL) {
         ESP_LOGE(TAG, "OpenWeatherMap returned invalid JSON");
         return ESP_ERR_INVALID_RESPONSE;
     }
-    cJSON *main_data = cJSON_GetObjectItemCaseSensitive(root, "main");
+    return ESP_OK;
+}
+
+static esp_err_t make_weather_url(char *url, size_t url_size, const char *path,
+                                  const char *extra_query)
+{
+    if (CONFIG_CLOCK_OPENWEATHERMAP_API_KEY[0] == '\0') {
+        ESP_LOGE(TAG, "Set the OpenWeatherMap API key in menuconfig");
+        return ESP_ERR_INVALID_ARG;
+    }
+    const int length = snprintf(
+        url, url_size,
+        "https://api.openweathermap.org%s?lat=%s&lon=%s&units=metric&%sappid=%s",
+        path, CONFIG_CLOCK_LATITUDE, CONFIG_CLOCK_LONGITUDE, extra_query,
+        CONFIG_CLOCK_OPENWEATHERMAP_API_KEY);
+    if (length < 0 || (size_t)length >= url_size) {
+        ESP_LOGE(TAG, "OpenWeatherMap request URL exceeds its configured buffer");
+        return ESP_ERR_INVALID_SIZE;
+    }
+    return ESP_OK;
+}
+
+static bool parse_weather_icon(cJSON *weather_array, char icon[4])
+{
+    if (!cJSON_IsArray(weather_array)) {
+        return false;
+    }
+    cJSON *condition = cJSON_GetArrayItem(weather_array, 0);
+    cJSON *icon_item = cJSON_GetObjectItemCaseSensitive(condition, "icon");
+    if (!cJSON_IsString(icon_item) || icon_item->valuestring == NULL ||
+        strlen(icon_item->valuestring) != 3) {
+        return false;
+    }
+    strlcpy(icon, icon_item->valuestring, 4);
+    return true;
+}
+
+static bool parse_current_weather(cJSON *current, weather_reading_t *reading)
+{
+    if (!cJSON_IsObject(current)) {
+        return false;
+    }
+    cJSON *main_data = cJSON_GetObjectItemCaseSensitive(current, "main");
+    if (main_data == NULL) {
+        main_data = current;
+    }
     cJSON *temperature = cJSON_GetObjectItemCaseSensitive(main_data, "temp");
     cJSON *humidity = cJSON_GetObjectItemCaseSensitive(main_data, "humidity");
-    cJSON *conditions = cJSON_GetObjectItemCaseSensitive(root, "weather");
-    cJSON *condition = cJSON_GetArrayItem(conditions, 0);
-    cJSON *icon = cJSON_GetObjectItemCaseSensitive(condition, "icon");
     if (!cJSON_IsNumber(temperature) || !cJSON_IsNumber(humidity) ||
-        !cJSON_IsString(icon) || icon->valuestring == NULL ||
-        strlen(icon->valuestring) != 3) {
-        ESP_LOGE(TAG, "OpenWeatherMap response is missing required weather fields");
-        cJSON_Delete(root);
-        return ESP_ERR_INVALID_RESPONSE;
+        !parse_weather_icon(cJSON_GetObjectItemCaseSensitive(current, "weather"),
+                            reading->icon)) {
+        return false;
     }
 
     reading->temperature = (int)lround(temperature->valuedouble);
     reading->humidity = humidity->valueint;
-    strlcpy(reading->icon, icon->valuestring, sizeof(reading->icon));
-    cJSON *sys = cJSON_GetObjectItemCaseSensitive(root, "sys");
+    cJSON *sys = cJSON_GetObjectItemCaseSensitive(current, "sys");
+    if (sys == NULL) {
+        sys = current;
+    }
     cJSON *sunrise = cJSON_GetObjectItemCaseSensitive(sys, "sunrise");
     cJSON *sunset = cJSON_GetObjectItemCaseSensitive(sys, "sunset");
     if (cJSON_IsNumber(sunrise) && cJSON_IsNumber(sunset) &&
@@ -735,10 +1094,421 @@ static esp_err_t fetch_weather(weather_reading_t *reading)
         ESP_LOGW(TAG, "Weather response has no valid sunrise/sunset times");
     }
     reading->valid = true;
+    return true;
+}
+
+static time_t next_local_hour(time_t now)
+{
+    struct tm local_time;
+    if (localtime_r(&now, &local_time) == NULL) {
+        return now + 3600;
+    }
+    local_time.tm_min = 0;
+    local_time.tm_sec = 0;
+    ++local_time.tm_hour;
+    return mktime(&local_time);
+}
+
+static void add_current_forecast_hour(weather_snapshot_t *snapshot, time_t now)
+{
+    struct tm current_hour;
+    snapshot->hours[0].timestamp = now;
+    if (localtime_r(&now, &current_hour) != NULL) {
+        current_hour.tm_min = 0;
+        current_hour.tm_sec = 0;
+        snapshot->hours[0].timestamp = mktime(&current_hour);
+    }
+    strlcpy(snapshot->hours[0].icon, snapshot->current.icon,
+            sizeof(snapshot->hours[0].icon));
+    snapshot->hour_count = 1;
+}
+
+static bool parse_forecast_hour(cJSON *item, forecast_hour_t *hour)
+{
+    if (!cJSON_IsObject(item)) {
+        return false;
+    }
+    cJSON *timestamp = cJSON_GetObjectItemCaseSensitive(item, "dt");
+    if (!cJSON_IsNumber(timestamp) || !isfinite(timestamp->valuedouble) ||
+        timestamp->valuedouble <= 0 || timestamp->valuedouble >= 4102444800.0 ||
+        !parse_weather_icon(cJSON_GetObjectItemCaseSensitive(item, "weather"),
+                            hour->icon)) {
+        return false;
+    }
+    hour->timestamp = (time_t)timestamp->valuedouble;
+    return true;
+}
+
+static esp_err_t reserve_one_call_request(time_t now)
+{
+    struct tm local_time;
+    if (localtime_r(&now, &local_time) == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    const uint32_t local_day = (uint32_t)(local_time.tm_year + 1900) * 1000U +
+                               (uint32_t)local_time.tm_yday;
+
+    nvs_handle_t handle;
+    esp_err_t result = nvs_open("weather_quota", NVS_READWRITE, &handle);
+    if (result != ESP_OK) {
+        return result;
+    }
+
+    uint32_t stored_day = 0;
+    uint16_t request_count = 0;
+    const esp_err_t day_result = nvs_get_u32(handle, "onecall_day", &stored_day);
+    if (day_result != ESP_OK && day_result != ESP_ERR_NVS_NOT_FOUND) {
+        nvs_close(handle);
+        return day_result;
+    }
+    if (day_result == ESP_OK && stored_day == local_day) {
+        const esp_err_t count_result = nvs_get_u16(handle, "onecall_count", &request_count);
+        if (count_result != ESP_OK && count_result != ESP_ERR_NVS_NOT_FOUND) {
+            nvs_close(handle);
+            return count_result;
+        }
+    }
+
+    if (request_count >= ONE_CALL_DAILY_LIMIT) {
+        ESP_LOGI(TAG, "One Call daily usage: %u/%u",
+                 (unsigned)request_count, (unsigned)ONE_CALL_DAILY_LIMIT);
+        nvs_close(handle);
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    result = nvs_set_u32(handle, "onecall_day", local_day);
+    if (result == ESP_OK) {
+        result = nvs_set_u16(handle, "onecall_count", request_count + 1);
+    }
+    if (result == ESP_OK) {
+        result = nvs_commit(handle);
+    }
+    nvs_close(handle);
+    if (result == ESP_OK) {
+        ESP_LOGI(TAG, "One Call daily usage: %u/%u",
+                 (unsigned)(request_count + 1), (unsigned)ONE_CALL_DAILY_LIMIT);
+    }
+    return result;
+}
+
+static int64_t days_from_civil(int year, unsigned month, unsigned day)
+{
+    year -= month <= 2;
+    const int era = (year >= 0 ? year : year - 399) / 400;
+    const unsigned year_of_era = (unsigned)(year - era * 400);
+    const int adjusted_month = (int)month + (month > 2 ? -3 : 9);
+    const unsigned day_of_year = (153 * (unsigned)adjusted_month + 2) / 5 + day - 1;
+    const unsigned day_of_era = year_of_era * 365 + year_of_era / 4 -
+                                year_of_era / 100 + day_of_year;
+    return (int64_t)era * 146097 + day_of_era - 719468;
+}
+
+static double normalize_degrees(double degrees)
+{
+    degrees = fmod(degrees, 360.0);
+    return degrees < 0 ? degrees + 360.0 : degrees;
+}
+
+static bool calculate_solar_event(const struct tm *local_date, double latitude,
+                                  double longitude, bool sunrise, time_t *event_time)
+{
+    const double radians = 3.14159265358979323846 / 180.0;
+    const double longitude_hour = longitude / 15.0;
+    const double day_number = local_date->tm_yday + 1.0;
+    const double approximate_time = day_number +
+        ((sunrise ? 6.0 : 18.0) - longitude_hour) / 24.0;
+    const double mean_anomaly = 0.9856 * approximate_time - 3.289;
+    const double true_longitude = normalize_degrees(
+        mean_anomaly + 1.916 * sin(mean_anomaly * radians) +
+        0.020 * sin(2.0 * mean_anomaly * radians) + 282.634);
+    double right_ascension = normalize_degrees(
+        atan(0.91764 * tan(true_longitude * radians)) / radians);
+    right_ascension += floor(true_longitude / 90.0) * 90.0 -
+                       floor(right_ascension / 90.0) * 90.0;
+    right_ascension /= 15.0;
+
+    const double sin_declination = 0.39782 * sin(true_longitude * radians);
+    const double cos_declination = cos(asin(sin_declination));
+    const double latitude_radians = latitude * radians;
+    const double denominator = cos_declination * cos(latitude_radians);
+    if (fabs(denominator) < 1e-12) {
+        return false;
+    }
+    const double cos_hour_angle =
+        (cos(90.833 * radians) - sin_declination * sin(latitude_radians)) /
+        denominator;
+    if (cos_hour_angle < -1.0 || cos_hour_angle > 1.0) {
+        return false;
+    }
+
+    const double hour_angle_degrees = acos(cos_hour_angle) / radians;
+    const double hour_angle = (sunrise ? 360.0 - hour_angle_degrees
+                                      : hour_angle_degrees) / 15.0;
+    const double local_mean_time = hour_angle + right_ascension -
+                                   0.06571 * approximate_time - 6.622;
+    double utc_hour = local_mean_time - longitude_hour;
+    int day_adjustment = 0;
+    while (utc_hour < 0.0) {
+        utc_hour += 24.0;
+        --day_adjustment;
+    }
+    while (utc_hour >= 24.0) {
+        utc_hour -= 24.0;
+        ++day_adjustment;
+    }
+
+    const int64_t utc_day = days_from_civil(1900 + local_date->tm_year,
+                                            (unsigned)local_date->tm_mon + 1,
+                                            (unsigned)local_date->tm_mday) +
+                            day_adjustment;
+    *event_time = (time_t)(utc_day * 86400 + (int64_t)llround(utc_hour * 3600.0));
+    return true;
+}
+
+static bool same_local_hour(time_t first, time_t second)
+{
+    struct tm first_local;
+    struct tm second_local;
+    return localtime_r(&first, &first_local) != NULL &&
+           localtime_r(&second, &second_local) != NULL &&
+           first_local.tm_year == second_local.tm_year &&
+           first_local.tm_yday == second_local.tm_yday &&
+           first_local.tm_hour == second_local.tm_hour;
+}
+
+static void insert_solar_event(weather_snapshot_t *snapshot, time_t event_time,
+                               bool sunrise, bool allow_missing_hour)
+{
+    if (event_time < snapshot->hours[0].timestamp ||
+        event_time > snapshot->hours[snapshot->hour_count - 1].timestamp) {
+        return;
+    }
+
+    for (uint8_t index = 0; index < snapshot->hour_count; ++index) {
+        if (same_local_hour(snapshot->hours[index].timestamp, event_time)) {
+            snapshot->hours[index].solar_event = true;
+            snapshot->hours[index].sunrise_event = sunrise;
+            return;
+        }
+    }
+    if (!allow_missing_hour) {
+        return;
+    }
+
+    uint8_t insert_index = 0;
+    while (insert_index < snapshot->hour_count &&
+           snapshot->hours[insert_index].timestamp < event_time) {
+        ++insert_index;
+    }
+    if (insert_index >= snapshot->hour_count) {
+        return;
+    }
+    if (snapshot->hour_count < WEATHER_FORECAST_HOURS) {
+        memmove(&snapshot->hours[insert_index + 1], &snapshot->hours[insert_index],
+                (snapshot->hour_count - insert_index) * sizeof(snapshot->hours[0]));
+        ++snapshot->hour_count;
+    } else {
+        memmove(&snapshot->hours[insert_index + 1], &snapshot->hours[insert_index],
+                (snapshot->hour_count - insert_index - 1) * sizeof(snapshot->hours[0]));
+    }
+    snapshot->hours[insert_index] = (forecast_hour_t){
+        .timestamp = event_time,
+        .solar_event = true,
+        .sunrise_event = sunrise,
+    };
+}
+
+static void add_solar_forecast_events(weather_snapshot_t *snapshot, time_t now,
+                                      bool allow_missing_hour)
+{
+    if (snapshot->hour_count == 0) {
+        return;
+    }
+    char *latitude_end;
+    char *longitude_end;
+    const double latitude = strtod(CONFIG_CLOCK_LATITUDE, &latitude_end);
+    const double longitude = strtod(CONFIG_CLOCK_LONGITUDE, &longitude_end);
+    if (CONFIG_CLOCK_LATITUDE[0] == '\0' || CONFIG_CLOCK_LONGITUDE[0] == '\0' ||
+        *latitude_end != '\0' || *longitude_end != '\0' ||
+        !isfinite(latitude) || !isfinite(longitude) ||
+        latitude < -90.0 || latitude > 90.0 ||
+        longitude < -180.0 || longitude > 180.0) {
+        return;
+    }
+
+    struct tm current_date;
+    if (localtime_r(&now, &current_date) == NULL) {
+        return;
+    }
+    for (int day_offset = 0; day_offset <= 2; ++day_offset) {
+        struct tm local_date = current_date;
+        local_date.tm_mday += day_offset;
+        local_date.tm_hour = 12;
+        local_date.tm_min = 0;
+        local_date.tm_sec = 0;
+        local_date.tm_isdst = -1;
+        const time_t local_midday = mktime(&local_date);
+        if (local_midday < 0 || localtime_r(&local_midday, &local_date) == NULL) {
+            continue;
+        }
+
+        time_t sunrise = 0;
+        time_t sunset = 0;
+        const bool has_sunrise = day_offset == 0 && snapshot->current.sunrise > 0
+            ? (sunrise = snapshot->current.sunrise, true)
+            : calculate_solar_event(&local_date, latitude, longitude, true, &sunrise);
+        const bool has_sunset = day_offset == 0 && snapshot->current.sunset > 0
+            ? (sunset = snapshot->current.sunset, true)
+            : calculate_solar_event(&local_date, latitude, longitude, false, &sunset);
+        if (has_sunrise) {
+            insert_solar_event(snapshot, sunrise, true, allow_missing_hour);
+        }
+        if (has_sunset) {
+            insert_solar_event(snapshot, sunset, false, allow_missing_hour);
+        }
+    }
+}
+
+static esp_err_t fetch_one_call(weather_snapshot_t *snapshot, time_t now)
+{
+    char url[512];
+    esp_err_t result = make_weather_url(url, sizeof(url), "/data/3.0/onecall",
+                                        "exclude=minutely,daily,alerts&");
+    if (result != ESP_OK) {
+        return result;
+    }
+    result = reserve_one_call_request(now);
+    if (result != ESP_OK) {
+        ESP_LOGW(TAG, "Skipping One Call request: %s", esp_err_to_name(result));
+        return result;
+    }
+    cJSON *root = NULL;
+    result = weather_http_get(url, &root);
+    if (result != ESP_OK) {
+        return result;
+    }
+    if (!cJSON_IsObject(root)) {
+        cJSON_Delete(root);
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+    cJSON *current = cJSON_GetObjectItemCaseSensitive(root, "current");
+    if (!parse_current_weather(current, &snapshot->current)) {
+        cJSON_Delete(root);
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+    add_current_forecast_hour(snapshot, now);
+
+    const time_t first_forecast = next_local_hour(now);
+    cJSON *hourly = cJSON_GetObjectItemCaseSensitive(root, "hourly");
+    const int count = cJSON_GetArraySize(hourly);
+    for (int index = 0; index < count &&
+         snapshot->hour_count < WEATHER_FORECAST_HOURS; ++index) {
+        forecast_hour_t hour = {0};
+        cJSON *item = cJSON_GetArrayItem(hourly, index);
+        if (parse_forecast_hour(item, &hour) && hour.timestamp >= first_forecast) {
+            snapshot->hours[snapshot->hour_count++] = hour;
+        }
+    }
     cJSON_Delete(root);
-    ESP_LOGI(TAG, "Weather updated: %d C, humidity %d%%",
-             reading->temperature, reading->humidity);
+    if (snapshot->hour_count == 0) {
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+    add_solar_forecast_events(snapshot, now, false);
     return ESP_OK;
+}
+
+static esp_err_t fetch_openweather_25(weather_snapshot_t *snapshot, time_t now)
+{
+    char url[512];
+    esp_err_t result = make_weather_url(url, sizeof(url), "/data/2.5/weather", "");
+    if (result != ESP_OK) {
+        return result;
+    }
+    cJSON *root = NULL;
+    result = weather_http_get(url, &root);
+    if (result != ESP_OK) {
+        return result;
+    }
+    if (!cJSON_IsObject(root)) {
+        cJSON_Delete(root);
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+    if (!parse_current_weather(root, &snapshot->current)) {
+        cJSON_Delete(root);
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+    add_current_forecast_hour(snapshot, now);
+    cJSON_Delete(root);
+
+    result = make_weather_url(url, sizeof(url), "/data/2.5/forecast", "");
+    if (result != ESP_OK) {
+        return result;
+    }
+    root = NULL;
+    result = weather_http_get(url, &root);
+    if (result != ESP_OK) {
+        return result;
+    }
+    if (!cJSON_IsObject(root)) {
+        cJSON_Delete(root);
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+    const time_t first_forecast = next_local_hour(now);
+    cJSON *list = cJSON_GetObjectItemCaseSensitive(root, "list");
+    const int count = cJSON_GetArraySize(list);
+    for (int index = 0; index < count &&
+         snapshot->hour_count < WEATHER_FORECAST_HOURS; ++index) {
+        forecast_hour_t hour = {0};
+        cJSON *item = cJSON_GetArrayItem(list, index);
+        if (parse_forecast_hour(item, &hour) && hour.timestamp >= first_forecast) {
+            snapshot->hours[snapshot->hour_count++] = hour;
+        }
+    }
+    cJSON_Delete(root);
+    if (snapshot->hour_count == 0) {
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+    add_solar_forecast_events(snapshot, now, true);
+    return ESP_OK;
+}
+
+static esp_err_t fetch_weather_snapshot(weather_snapshot_t *snapshot, time_t now)
+{
+    esp_err_t result = fetch_one_call(snapshot, now);
+    if (result == ESP_OK) {
+        return ESP_OK;
+    }
+    ESP_LOGW(TAG, "One Call 3.0 unavailable (%s); trying 2.5 forecast",
+             esp_err_to_name(result));
+    memset(snapshot, 0, sizeof(*snapshot));
+    result = fetch_openweather_25(snapshot, now);
+    if (result == ESP_OK) {
+        ESP_LOGI(TAG, "Using OpenWeatherMap 2.5 current and 3-hour forecasts");
+    }
+    return result;
+}
+
+static bool weather_data_equal(const weather_snapshot_t *left,
+                               const weather_snapshot_t *right)
+{
+    if (left->current.temperature != right->current.temperature ||
+        left->current.humidity != right->current.humidity ||
+        strcmp(left->current.icon, right->current.icon) != 0 ||
+        left->current.sunrise != right->current.sunrise ||
+        left->current.sunset != right->current.sunset ||
+        left->current.valid != right->current.valid ||
+        left->hour_count != right->hour_count) {
+        return false;
+    }
+    for (uint8_t index = 0; index < left->hour_count; ++index) {
+        if (left->hours[index].timestamp != right->hours[index].timestamp ||
+            strcmp(left->hours[index].icon, right->hours[index].icon) != 0 ||
+            left->hours[index].solar_event != right->hours[index].solar_event ||
+            left->hours[index].sunrise_event != right->hours[index].sunrise_event) {
+            return false;
+        }
+    }
+    return true;
 }
 
 static void weather_task(void *argument)
@@ -751,14 +1521,21 @@ static void weather_task(void *argument)
             continue;
         }
 
-        weather_reading_t updated = {0};
-        const esp_err_t result = fetch_weather(&updated);
+        weather_snapshot_t updated = {0};
+        const esp_err_t result = fetch_weather_snapshot(&updated, now);
         if (result == ESP_OK) {
             portENTER_CRITICAL(&weather_mux);
-            current_weather = updated;
+            if (!weather_data_equal(&current_weather, &updated)) {
+                updated.generation = current_weather.generation + 1;
+                current_weather = updated;
+            }
             portEXIT_CRITICAL(&weather_mux);
+            ESP_LOGI(TAG, "Weather updated: %d C, humidity %d%%, %u forecast hours",
+                     updated.current.temperature, updated.current.humidity,
+                     (unsigned)updated.hour_count);
             vTaskDelay(pdMS_TO_TICKS(WEATHER_REFRESH_SECONDS * 1000));
         } else {
+            ESP_LOGE(TAG, "Weather update failed: %s", esp_err_to_name(result));
             vTaskDelay(pdMS_TO_TICKS(WEATHER_RETRY_SECONDS * 1000));
         }
     }
@@ -774,6 +1551,83 @@ static void start_time_sync(void)
     ESP_LOGI(TAG, "Synchronizing time with %s", CONFIG_CLOCK_NTP_SERVER);
 }
 
+typedef struct {
+    bool stable_pressed;
+    bool candidate_pressed;
+    int64_t candidate_since_us;
+} boot_button_state_t;
+
+static void configure_boot_button(void)
+{
+    gpio_config_t input_pin = {
+        .pin_bit_mask = 1ULL << PIN_BOOT,
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    ESP_ERROR_CHECK(gpio_config(&input_pin));
+}
+
+static bool update_boot_button(boot_button_state_t *state, bool *forecast_face)
+{
+    const bool pressed = gpio_get_level(PIN_BOOT) == 0;
+    const int64_t now_us = esp_timer_get_time();
+    if (pressed != state->candidate_pressed) {
+        state->candidate_pressed = pressed;
+        state->candidate_since_us = now_us;
+    } else if (pressed != state->stable_pressed &&
+               now_us - state->candidate_since_us >= 40000) {
+        state->stable_pressed = pressed;
+        if (pressed) {
+            *forecast_face = !*forecast_face;
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool load_forecast_face(void)
+{
+    nvs_handle_t handle;
+    esp_err_t result = nvs_open(CLOCK_STATE_NVS_NAMESPACE, NVS_READONLY, &handle);
+    if (result == ESP_ERR_NVS_NOT_FOUND) {
+        return false;
+    }
+    if (result != ESP_OK) {
+        ESP_LOGW(TAG, "Could not open clockface state: %s", esp_err_to_name(result));
+        return false;
+    }
+
+    uint8_t stored_face = 0;
+    result = nvs_get_u8(handle, CLOCK_STATE_NVS_KEY, &stored_face);
+    nvs_close(handle);
+    if (result != ESP_OK && result != ESP_ERR_NVS_NOT_FOUND) {
+        ESP_LOGW(TAG, "Could not read clockface state: %s", esp_err_to_name(result));
+        return false;
+    }
+    return stored_face != 0;
+}
+
+static void save_forecast_face(bool forecast_face)
+{
+    nvs_handle_t handle;
+    esp_err_t result = nvs_open(CLOCK_STATE_NVS_NAMESPACE, NVS_READWRITE, &handle);
+    if (result != ESP_OK) {
+        ESP_LOGW(TAG, "Could not open clockface state: %s", esp_err_to_name(result));
+        return;
+    }
+
+    result = nvs_set_u8(handle, CLOCK_STATE_NVS_KEY, forecast_face ? 1 : 0);
+    if (result == ESP_OK) {
+        result = nvs_commit(handle);
+    }
+    nvs_close(handle);
+    if (result != ESP_OK) {
+        ESP_LOGW(TAG, "Could not save clockface state: %s", esp_err_to_name(result));
+    }
+}
+
 void app_main(void)
 {
     esp_err_t result = nvs_flash_init();
@@ -782,6 +1636,9 @@ void app_main(void)
         result = nvs_flash_init();
     }
     ESP_ERROR_CHECK(result);
+    bool forecast_face = load_forecast_face();
+    ESP_LOGI(TAG, "Restored %s clockface",
+             forecast_face ? "forecast" : "current");
 
     framebuffer = heap_caps_malloc(
         DISPLAY_WIDTH * DISPLAY_HEIGHT * sizeof(*framebuffer),
@@ -797,7 +1654,8 @@ void app_main(void)
              (unsigned)esp_get_free_heap_size());
 
     display_initialize();
-    draw_clock_face(NULL, NULL, 0, false);
+    configure_boot_button();
+    draw_clock_face(NULL, NULL, 0, false, forecast_face);
     ESP_LOGI(TAG, "Clock face drawn; first pixel=0x%04X, center=0x%04X",
              framebuffer[0], framebuffer[CENTER_Y * DISPLAY_WIDTH + CENTER_X]);
     flush_display();
@@ -813,27 +1671,47 @@ void app_main(void)
         ESP_LOGE(TAG, "Could not start the OpenWeatherMap task");
     }
 
+    const bool initially_pressed = gpio_get_level(PIN_BOOT) == 0;
+    boot_button_state_t button = {
+        .stable_pressed = initially_pressed,
+        .candidate_pressed = initially_pressed,
+        .candidate_since_us = esp_timer_get_time(),
+    };
+    int64_t last_render_us = 0;
     while (true) {
+        const bool face_changed = update_boot_button(&button, &forecast_face);
+        if (face_changed) {
+            save_forecast_face(forecast_face);
+        }
         struct tm time_info;
         const time_t now = time(NULL);
         if (now < 1577836800 || localtime_r(&now, &time_info) == NULL) {
             ESP_LOGW(TAG, "Waiting for NTP time synchronization");
-            vTaskDelay(pdMS_TO_TICKS(1000));
+            if (face_changed) {
+                draw_clock_face(NULL, NULL, now, false, forecast_face);
+                flush_display();
+            }
+            vTaskDelay(pdMS_TO_TICKS(10));
             continue;
         }
 
-        weather_reading_t weather;
+        weather_snapshot_t weather;
         portENTER_CRITICAL(&weather_mux);
         weather = current_weather;
         portEXIT_CRITICAL(&weather_mux);
+        if (weather_icon_cache_generation != weather.generation) {
+            rebuild_weather_icon_cache(&weather);
+        }
         const bool colon_white = (esp_timer_get_time() / 500000) % 2 == 0;
-        draw_clock_face(&time_info, &weather, now, colon_white);
-        flush_display();
-
-        ESP_LOGI(TAG, "Clock frame drawn for %02d:%02d:%02d",
-                 time_info.tm_hour, time_info.tm_min, time_info.tm_sec);
-        const int delay_ms = 500 - (int)((esp_timer_get_time() / 1000) % 500);
-        const TickType_t delay_ticks = pdMS_TO_TICKS(delay_ms);
-        vTaskDelay(delay_ticks > 0 ? delay_ticks : 1);
+        const int64_t render_time_us = esp_timer_get_time();
+        if (face_changed || render_time_us - last_render_us >= 500000) {
+            draw_clock_face(&time_info, &weather, now, colon_white, forecast_face);
+            flush_display();
+            last_render_us = render_time_us;
+            ESP_LOGI(TAG, "Clock frame drawn for %02d:%02d:%02d (%s)",
+                     time_info.tm_hour, time_info.tm_min, time_info.tm_sec,
+                     forecast_face ? "forecast" : "current");
+        }
+        vTaskDelay(pdMS_TO_TICKS(10));
     }
 }
