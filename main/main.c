@@ -9,18 +9,23 @@
 #include "driver/gpio.h"
 #include "driver/spi_master.h"
 #include "cJSON.h"
+#include "esp_app_desc.h"
 #include "esp_crt_bundle.h"
 #include "esp_event.h"
 #include "esp_heap_caps.h"
 #include "esp_http_client.h"
+#include "esp_http_server.h"
 #include "esp_log.h"
 #include "esp_netif.h"
+#include "esp_ota_ops.h"
 #include "esp_sntp.h"
+#include "esp_system.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
 #include "freertos/task.h"
+#include "font.h"
 #include "nvs.h"
 #include "nvs_flash.h"
 #include "sdkconfig.h"
@@ -60,6 +65,7 @@
 
 static const char *TAG = "net_clock";
 static const uint16_t DIAL_COLOR = RGB565(90, 90, 100);
+static const uint16_t INACTIVE_SEGMENT_COLOR = RGB565(45, 45, 50);
 static const uint16_t MIN_COLOR = RGB565(0, 225, 240);
 static const uint16_t SECOND_COLOR = RGB565(255, 255, 255);
 static const uint16_t FIVE_SECOND_COLOR = RGB565(0, 255, 30);
@@ -110,6 +116,8 @@ static forecast_weather_icon_t forecast_icon_cache[WEATHER_FORECAST_HOURS];
 static size_t forecast_icon_cache_count;
 static uint16_t weather_icon_decode_scratch[WEATHER_ICON_PIXELS];
 static uint32_t weather_icon_cache_generation = UINT32_MAX;
+static httpd_handle_t ota_http_server;
+static bool ota_update_in_progress;
 
 static esp_err_t spi_write_selected(bool data_mode, const void *data, size_t length)
 {
@@ -264,6 +272,34 @@ static void set_pixel(int x, int y, uint16_t color)
     }
 }
 
+static uint16_t get_pixel(int x, int y)
+{
+    if (x >= 0 && x < DISPLAY_WIDTH && y >= 0 && y < DISPLAY_HEIGHT) {
+        return SWAP16(framebuffer[y * DISPLAY_WIDTH + x]);
+    }
+    return 0;
+}
+
+static uint16_t blend_rgb565(uint16_t background, uint16_t foreground, uint8_t alpha)
+{
+    const uint32_t background_red = (background >> 11) & 0x1F;
+    const uint32_t background_green = (background >> 5) & 0x3F;
+    const uint32_t background_blue = background & 0x1F;
+
+    const uint32_t foreground_red = (foreground >> 11) & 0x1F;
+    const uint32_t foreground_green = (foreground >> 5) & 0x3F;
+    const uint32_t foreground_blue = foreground & 0x1F;
+
+    const uint32_t red =
+        (background_red * (255 - alpha) + foreground_red * alpha + 127) / 255;
+    const uint32_t green =
+        (background_green * (255 - alpha) + foreground_green * alpha + 127) / 255;
+    const uint32_t blue =
+        (background_blue * (255 - alpha) + foreground_blue * alpha + 127) / 255;
+
+    return (uint16_t)((red << 11) | (green << 5) | blue);
+}
+
 static void draw_line(int x0, int y0, int x1, int y1, uint16_t color)
 {
     const int dx = abs(x1 - x0);
@@ -285,15 +321,6 @@ static void draw_line(int x0, int y0, int x1, int y1, uint16_t color)
         if (doubled_error <= dx) {
             error += dx;
             y0 += sy;
-        }
-    }
-}
-
-static void fill_rectangle(int x, int y, int width, int height, uint16_t color)
-{
-    for (int row = y; row < y + height; ++row) {
-        for (int column = x; column < x + width; ++column) {
-            set_pixel(column, row, color);
         }
     }
 }
@@ -323,107 +350,69 @@ static void draw_circle(int center_x, int center_y, int radius, uint16_t color)
     }
 }
 
-static void fill_circle(int center_x, int center_y, int radius, uint16_t color)
+static uint32_t next_text_character(const char **text)
 {
-    for (int y = -radius; y <= radius; ++y) {
-        const int half_width = (int)sqrtf((float)(radius * radius - y * y));
-        draw_line(center_x - half_width, center_y + y,
-                  center_x + half_width, center_y + y, color);
+    const unsigned char first = (unsigned char)(*text)[0];
+    if ((first & 0xE0) == 0xC0 && ((unsigned char)(*text)[1] & 0xC0) == 0x80) {
+        const unsigned char second = (unsigned char)(*text)[1];
+        *text += 2;
+        return ((first & 0x1F) << 6) | (second & 0x3F);
     }
+    ++*text;
+    return first;
 }
 
-static const char font_characters[] = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ:-.%";
-static const uint8_t font5x7[][5] = {
-    {0x3E, 0x51, 0x49, 0x45, 0x3E}, {0x00, 0x42, 0x7F, 0x40, 0x00},
-    {0x42, 0x61, 0x51, 0x49, 0x46}, {0x21, 0x41, 0x45, 0x4B, 0x31},
-    {0x18, 0x14, 0x12, 0x7F, 0x10}, {0x27, 0x45, 0x45, 0x45, 0x39},
-    {0x3C, 0x4A, 0x49, 0x49, 0x30}, {0x01, 0x71, 0x09, 0x05, 0x03},
-    {0x36, 0x49, 0x49, 0x49, 0x36}, {0x06, 0x49, 0x49, 0x29, 0x1E},
-    {0x7E, 0x11, 0x11, 0x11, 0x7E}, {0x7F, 0x49, 0x49, 0x49, 0x36},
-    {0x3E, 0x41, 0x41, 0x41, 0x22}, {0x7F, 0x41, 0x41, 0x22, 0x1C},
-    {0x7F, 0x49, 0x49, 0x49, 0x41}, {0x7F, 0x09, 0x09, 0x09, 0x01},
-    {0x3E, 0x41, 0x49, 0x49, 0x7A}, {0x7F, 0x08, 0x08, 0x08, 0x7F},
-    {0x00, 0x41, 0x7F, 0x41, 0x00}, {0x20, 0x40, 0x41, 0x3F, 0x01},
-    {0x7F, 0x08, 0x14, 0x22, 0x41}, {0x7F, 0x40, 0x40, 0x40, 0x40},
-    {0x7F, 0x02, 0x0C, 0x02, 0x7F}, {0x7F, 0x04, 0x08, 0x10, 0x7F},
-    {0x3E, 0x41, 0x41, 0x41, 0x3E}, {0x7F, 0x09, 0x09, 0x09, 0x06},
-    {0x3E, 0x41, 0x51, 0x21, 0x5E}, {0x7F, 0x09, 0x19, 0x29, 0x46},
-    {0x46, 0x49, 0x49, 0x49, 0x31}, {0x01, 0x01, 0x7F, 0x01, 0x01},
-    {0x3F, 0x40, 0x40, 0x40, 0x3F}, {0x1F, 0x20, 0x40, 0x20, 0x1F},
-    {0x3F, 0x40, 0x38, 0x40, 0x3F}, {0x63, 0x14, 0x08, 0x14, 0x63},
-    {0x07, 0x08, 0x70, 0x08, 0x07}, {0x61, 0x51, 0x49, 0x45, 0x43},
-    {0x00, 0x36, 0x36, 0x00, 0x00}, {0x08, 0x08, 0x08, 0x08, 0x08},
-    {0x00, 0x60, 0x60, 0x00, 0x00}, {0x63, 0x13, 0x08, 0x64, 0x63},
-};
-
-static const uint8_t *find_glyph(char character)
+static int text_width(const char *text, const clock_font_t *font)
 {
-    const char *match = strchr(font_characters, character);
-    return match == NULL ? NULL : font5x7[match - font_characters];
+    size_t length = 0;
+    size_t colon_count = 0;
+    while (*text != '\0') {
+        colon_count += next_text_character(&text) == ':';
+        ++length;
+    }
+    return length == 0 ? 0 : (int)lroundf(0.5f * (
+        (length - 1) * font->advance_half + 2 * font->width -
+        colon_count * font->colon_adjust_half));
 }
 
-static int text_width(const char *text, int scale)
+static void make_text_placeholder(const char *text, char *placeholder, size_t size,
+                                  char placeholder_character)
 {
-    const size_t length = strlen(text);
-    return length == 0 ? 0 : (int)(length * 6 - 1) * scale;
+    size_t index = 0;
+    while (text[index] != '\0' && index + 1 < size) {
+        placeholder[index] = text[index] == ' ' || text[index] == ':'
+            ? text[index] : placeholder_character;
+        ++index;
+    }
+    placeholder[index] = '\0';
 }
 
-static void draw_text(const char *text, int x, int y, int scale, uint16_t color)
+static void draw_text(const char *text, const clock_font_t *font, int x, int y,
+                      uint16_t color)
 {
-    for (; *text != '\0'; ++text, x += 6 * scale) {
-        const uint8_t *glyph = find_glyph(*text);
-        if (glyph == NULL) {
-            continue;
-        }
-        for (int column = 0; column < 5; ++column) {
-            for (int row = 0; row < 7; ++row) {
-                if (glyph[column] & (1U << row)) {
-                    fill_rectangle(x + column * scale, y + row * scale,
-                                   scale, scale, color);
+    int offset_half = 0;
+    while (*text != '\0') {
+        const uint32_t character = next_text_character(&text);
+        const unsigned phase = font->phases == 2 ? (unsigned)(offset_half & 1) : 0;
+        const uint8_t *glyph = clock_font_glyph(font, character, phase);
+        if (glyph != NULL) {
+            for (int row = 0; row < font->height; ++row) {
+                for (int column = 0; column < font->width; ++column) {
+                    const int pixel = row * font->width + column;
+                    const uint8_t packed = glyph[pixel / 2];
+                    const uint8_t alpha = ((pixel & 1) ? packed & 0x0F : packed >> 4) * 17;
+                    const int pixel_x = x + offset_half / 2 + column;
+                    if (alpha == 255) {
+                        set_pixel(pixel_x, y + row, color);
+                    } else if (alpha != 0) {
+                        set_pixel(pixel_x, y + row,
+                                  blend_rgb565(get_pixel(pixel_x, y + row), color, alpha));
+                    }
                 }
             }
         }
-    }
-}
-
-static const char forecast_font4x7_characters[] = "0123456789:";
-static const uint8_t forecast_font4x7[][7] = {
-    {0x6, 0x9, 0x9, 0x9, 0x9, 0x9, 0x6},
-    {0x2, 0x6, 0x2, 0x2, 0x2, 0x2, 0x7},
-    {0x6, 0x9, 0x1, 0x2, 0x4, 0x8, 0xF},
-    {0xE, 0x1, 0x1, 0x6, 0x1, 0x1, 0xE},
-    {0x9, 0x9, 0x9, 0xF, 0x1, 0x1, 0x1},
-    {0xF, 0x8, 0x8, 0xE, 0x1, 0x9, 0x6},
-    {0x7, 0x8, 0x8, 0xE, 0x9, 0x9, 0x6},
-    {0xF, 0x1, 0x2, 0x2, 0x4, 0x4, 0x4},
-    {0x6, 0x9, 0x9, 0x6, 0x9, 0x9, 0x6},
-    {0x6, 0x9, 0x9, 0x7, 0x1, 0x1, 0xE},
-    {0x0, 0x6, 0x6, 0x0, 0x6, 0x6, 0x0},
-};
-
-static int forecast_time_text_width(const char *text, int scale)
-{
-    const size_t length = strlen(text);
-    return length == 0 ? 0 : (int)(length * 5 - 1) * scale;
-}
-
-static void draw_forecast_time_text(const char *text, int x, int y, int scale,
-                                    uint16_t color)
-{
-    for (; *text != '\0'; ++text, x += 5 * scale) {
-        const char *match = strchr(forecast_font4x7_characters, *text);
-        if (match == NULL) {
-            continue;
-        }
-        const uint8_t *glyph = forecast_font4x7[match - forecast_font4x7_characters];
-        for (int row = 0; row < 7; ++row) {
-            for (int column = 0; column < 4; ++column) {
-                if (glyph[row] & (1U << (3 - column))) {
-                    fill_rectangle(x + column * scale, y + row * scale,
-                                   scale, scale, color);
-                }
-            }
-        }
+        offset_half += font->advance_half -
+                       (character == ':' ? font->colon_adjust_half : 0);
     }
 }
 
@@ -737,8 +726,10 @@ static void draw_clock_face(const struct tm *time_info, const weather_snapshot_t
                     const int label_center_y = CENTER_Y +
                         (int)lroundf(sinf(angle) * 84);
                     draw_text(hour_text,
-                              label_center_x - text_width(hour_text, 1) / 2,
-                              label_center_y - 3, 1, FORECAST_HOUR_COLOR);
+                              &clock_font_small,
+                              label_center_x - text_width(hour_text, &clock_font_small) / 2,
+                              label_center_y - clock_font_small.height / 2,
+                              FORECAST_HOUR_COLOR);
                 }
                 const float icon_angle = (index * 30.0f + 15.0f - 90.0f) *
                                          3.14159265f / 180.0f;
@@ -769,16 +760,20 @@ static void draw_clock_face(const struct tm *time_info, const weather_snapshot_t
 
     if (time_info != NULL) {
         char time_text[6];
+        char time_placeholder[sizeof(time_text)];
         strftime(time_text, sizeof(time_text), "%H:%M", time_info);
+        make_text_placeholder(time_text, time_placeholder,
+                              sizeof(time_placeholder), '8');
         if (forecast_face) {
-            const int scale = 6;
-            const int time_x =
-                (DISPLAY_WIDTH - forecast_time_text_width(time_text, scale)) / 2;
-            const int time_y = (DISPLAY_HEIGHT - 7 * scale) / 2;
-            const int date_scale = 3;
+            const clock_font_t *time_font = &clock_font_narrow_time;
+            const clock_font_t *date_font = &clock_font_date;
+            const int time_x = (DISPLAY_WIDTH - text_width(time_text, time_font)) / 2;
+            const int time_y = (DISPLAY_HEIGHT - time_font->height) / 2;
             const int date_gap = 12;
             char weekday_text[4];
+            char weekday_placeholder[sizeof(weekday_text)];
             char date_text[8];
+            char date_placeholder[sizeof(date_text)];
             strftime(weekday_text, sizeof(weekday_text), "%a", time_info);
             strftime(date_text, sizeof(date_text), "%d %b", time_info);
             for (char *character = weekday_text; *character != '\0'; ++character) {
@@ -791,45 +786,65 @@ static void draw_clock_face(const struct tm *time_info, const weather_snapshot_t
                     *character = (char)(*character - 'a' + 'A');
                 }
             }
-            draw_text(weekday_text,
-                      (DISPLAY_WIDTH - text_width(weekday_text, date_scale)) / 2,
-                      time_y - 7 * date_scale - date_gap, date_scale, MIN_COLOR);
-            draw_forecast_time_text(time_text, time_x, time_y, scale,
-                                    RGB565(255, 255, 255));
+            make_text_placeholder(weekday_text, weekday_placeholder,
+                                  sizeof(weekday_placeholder), '~');
+            make_text_placeholder(date_text, date_placeholder,
+                                  sizeof(date_placeholder), '~');
+            const int weekday_x =
+                (DISPLAY_WIDTH - text_width(weekday_text, date_font)) / 2;
+            const int weekday_y = time_y - date_font->height - date_gap;
+            draw_text(weekday_placeholder, date_font, weekday_x, weekday_y,
+                      INACTIVE_SEGMENT_COLOR);
+            draw_text(weekday_text, date_font, weekday_x, weekday_y, MIN_COLOR);
+                draw_text(time_placeholder, time_font, time_x, time_y,
+                    INACTIVE_SEGMENT_COLOR);
+            draw_text(time_text, time_font, time_x, time_y,
+                    RGB565(255, 255, 255));
             if (!colon_white) {
-                const int colon_x = time_x + 2 * 5 * scale;
-                draw_forecast_time_text(":", colon_x, time_y, scale, DIAL_COLOR);
+                const int colon_x = time_x + time_font->advance_half;
+                draw_text(":", time_font, colon_x, time_y, DIAL_COLOR);
             }
-            draw_text(date_text,
-                      (DISPLAY_WIDTH - text_width(date_text, date_scale)) / 2,
-                      time_y + 7 * scale + date_gap, date_scale, MIN_COLOR);
+            const int date_x = (DISPLAY_WIDTH - text_width(date_text, date_font)) / 2;
+            const int date_y = time_y + time_font->height + date_gap;
+            draw_text(date_placeholder, date_font, date_x, date_y,
+                      INACTIVE_SEGMENT_COLOR);
+            draw_text(date_text, date_font, date_x, date_y, MIN_COLOR);
         } else {
             char date_text[16];
+            char date_placeholder[sizeof(date_text)];
             strftime(date_text, sizeof(date_text), "%a %d", time_info);
             for (char *character = date_text; *character != '\0'; ++character) {
                 if (*character >= 'a' && *character <= 'z') {
                     *character = (char)(*character - 'a' + 'A');
                 }
             }
-            draw_text(date_text, (DISPLAY_WIDTH - text_width(date_text, 3)) / 2,
-                      43, 3, MIN_COLOR);
-            draw_text(time_text, (DISPLAY_WIDTH - text_width(time_text, 6)) / 2,
-                      78, 6, RGB565(255, 255, 255));
+            make_text_placeholder(date_text, date_placeholder,
+                                  sizeof(date_placeholder), '~');
+            const int date_x =
+                (DISPLAY_WIDTH - text_width(date_text, &clock_font_date)) / 2;
+            draw_text(date_placeholder, &clock_font_date, date_x, 43,
+                      INACTIVE_SEGMENT_COLOR);
+            draw_text(date_text, &clock_font_date, date_x, 43, MIN_COLOR);
+            const int time_x =
+                (DISPLAY_WIDTH - text_width(time_text, &clock_font_time)) / 2;
+            draw_text(time_placeholder, &clock_font_time, time_x, 78,
+                      INACTIVE_SEGMENT_COLOR);
+            draw_text(time_text, &clock_font_time, time_x, 78,
+                      RGB565(255, 255, 255));
             if (!colon_white) {
-                const int colon_x = (DISPLAY_WIDTH - text_width(time_text, 6)) / 2 +
-                                    2 * 6 * 6;
-                draw_text(":", colon_x, 78, 6, DIAL_COLOR);
+                const int colon_x = time_x + clock_font_time.advance_half;
+                draw_text(":", &clock_font_time, colon_x, 78, DIAL_COLOR);
             }
         }
     }
 
     if (weather != NULL && weather->current.valid && !forecast_face) {
         draw_cached_weather_icon(
-            weather_icon_for_reading(&weather->current, now), 54, 128, false);
+            weather_icon_for_reading(&weather->current, now), 44, 128, false);
     }
 
     if (!forecast_face) {
-        char temperature_text[8];
+        char temperature_text[16];
         char humidity_text[8];
         if (weather != NULL && weather->current.valid) {
             snprintf(temperature_text, sizeof(temperature_text), "%d",
@@ -840,23 +855,19 @@ static void draw_clock_face(const struct tm *time_info, const weather_snapshot_t
             strlcpy(temperature_text, "--", sizeof(temperature_text));
             strlcpy(humidity_text, "--%", sizeof(humidity_text));
         }
-        const int temperature_scale = strlen(temperature_text) > 3 ? 3 : 4;
-        const int temperature_x = 119;
+        const clock_font_t *temperature_font = strlen(temperature_text) > 2
+            ? &clock_font_date : &clock_font_temperature;
+        strlcat(temperature_text, "\xC2\xB0" "C", sizeof(temperature_text));
+        const int temperature_x = 109;
         const int temperature_y = 139;
-        const int temperature_width = text_width(temperature_text, temperature_scale);
-        draw_text(temperature_text, temperature_x, temperature_y, temperature_scale,
+        draw_text(temperature_text, temperature_font, temperature_x, temperature_y,
                   RGB565(255, 20, 20));
-        const int degree_x = temperature_x + temperature_width + 5;
-        fill_circle(degree_x, temperature_y + 4, 4, RGB565(255, 20, 20));
-        fill_circle(degree_x, temperature_y + 4, 2, RGB565(0, 0, 0));
-        draw_text("C", degree_x + 8, temperature_y + 7, 3, RGB565(255, 20, 20));
 
-        const int humidity_scale = 3;
-        const int humidity_width = text_width(humidity_text, humidity_scale);
+        const int humidity_width = text_width(humidity_text, &clock_font_humidity);
         const int humidity_start = (DISPLAY_WIDTH - (humidity_width + 27)) / 2;
         draw_droplet(humidity_start + 9, 180, RGB565(0, 90, 255));
-        draw_text(humidity_text, humidity_start + 27, 183, humidity_scale,
-                  RGB565(0, 90, 255));
+        draw_text(humidity_text, &clock_font_humidity, humidity_start + 27, 183,
+              RGB565(0, 90, 255));
     }
 }
 
@@ -1105,6 +1116,7 @@ static time_t next_local_hour(time_t now)
     }
     local_time.tm_min = 0;
     local_time.tm_sec = 0;
+    local_time.tm_isdst = -1;
     ++local_time.tm_hour;
     return mktime(&local_time);
 }
@@ -1116,6 +1128,7 @@ static void add_current_forecast_hour(weather_snapshot_t *snapshot, time_t now)
     if (localtime_r(&now, &current_hour) != NULL) {
         current_hour.tm_min = 0;
         current_hour.tm_sec = 0;
+        current_hour.tm_isdst = -1;
         snapshot->hours[0].timestamp = mktime(&current_hour);
     }
     strlcpy(snapshot->hours[0].icon, snapshot->current.icon,
@@ -1279,8 +1292,9 @@ static bool same_local_hour(time_t first, time_t second)
 static void insert_solar_event(weather_snapshot_t *snapshot, time_t event_time,
                                bool sunrise, bool allow_missing_hour)
 {
-    if (event_time < snapshot->hours[0].timestamp ||
-        event_time > snapshot->hours[snapshot->hour_count - 1].timestamp) {
+    if (snapshot->hour_count == 0 ||
+        event_time < snapshot->hours[0].timestamp ||
+        event_time >= snapshot->hours[snapshot->hour_count - 1].timestamp + 3600) {
         return;
     }
 
@@ -1300,7 +1314,7 @@ static void insert_solar_event(weather_snapshot_t *snapshot, time_t event_time,
            snapshot->hours[insert_index].timestamp < event_time) {
         ++insert_index;
     }
-    if (insert_index >= snapshot->hour_count) {
+    if (insert_index >= WEATHER_FORECAST_HOURS) {
         return;
     }
     if (snapshot->hour_count < WEATHER_FORECAST_HOURS) {
@@ -1533,7 +1547,17 @@ static void weather_task(void *argument)
             ESP_LOGI(TAG, "Weather updated: %d C, humidity %d%%, %u forecast hours",
                      updated.current.temperature, updated.current.humidity,
                      (unsigned)updated.hour_count);
-            vTaskDelay(pdMS_TO_TICKS(WEATHER_REFRESH_SECONDS * 1000));
+
+            const time_t after_fetch = time(NULL);
+            uint32_t sleep_seconds = WEATHER_REFRESH_SECONDS;
+            if (after_fetch >= 1577836800) {
+                sleep_seconds = WEATHER_REFRESH_SECONDS -
+                                (uint32_t)(after_fetch % WEATHER_REFRESH_SECONDS);
+                if (sleep_seconds == 0) {
+                    sleep_seconds = WEATHER_REFRESH_SECONDS;
+                }
+            }
+            vTaskDelay(pdMS_TO_TICKS(sleep_seconds * 1000));
         } else {
             ESP_LOGE(TAG, "Weather update failed: %s", esp_err_to_name(result));
             vTaskDelay(pdMS_TO_TICKS(WEATHER_RETRY_SECONDS * 1000));
@@ -1549,6 +1573,193 @@ static void start_time_sync(void)
     esp_sntp_setservername(0, CONFIG_CLOCK_NTP_SERVER);
     esp_sntp_init();
     ESP_LOGI(TAG, "Synchronizing time with %s", CONFIG_CLOCK_NTP_SERVER);
+}
+
+static esp_err_t ota_page_handler(httpd_req_t *request)
+{
+    static const char page[] =
+        "<!doctype html><html lang='en'><meta charset='utf-8'>"
+        "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+        "<title>Network Clock Update</title><style>"
+        "*{box-sizing:border-box}body{margin:0;min-height:100vh;display:grid;"
+        "place-items:center;background:#e8eee9;color:#14251e;font:16px system-ui}"
+        "main{width:min(92vw,460px);padding:30px;background:#fff;border:1px solid #c7d2ca;"
+        "border-radius:8px}h1{font-size:24px;margin:0 0 24px}label{display:block;"
+        "font-weight:600;margin:18px 0 7px}input{width:100%;padding:11px;border:1px solid #9cac9f;"
+        "border-radius:4px;font:inherit}button{margin-top:22px;padding:11px 16px;"
+        "background:#176b50;color:white;border:0;border-radius:4px;font:inherit;cursor:pointer}"
+        "button:disabled{opacity:.55}progress{width:100%;margin-top:18px}#status{min-height:24px}"
+        "</style><main><h1>Network Clock Firmware</h1><form id='form'>"
+        "<label for='password'>OTA password</label><input id='password' type='password'"
+        "autocomplete='current-password' required><label for='firmware'>Firmware (.bin)</label>"
+        "<input id='firmware' type='file' accept='.bin,application/octet-stream' required>"
+        "<button id='upload'>Install update</button></form><progress id='progress' max='100' value='0' hidden>"
+        "</progress><p id='status' role='status'></p><script>"
+        "const f=document.querySelector('#form'),b=document.querySelector('#upload'),"
+        "p=document.querySelector('#progress'),s=document.querySelector('#status');"
+        "f.addEventListener('submit',e=>{e.preventDefault();const file=document.querySelector('#firmware').files[0];"
+        "if(!file)return;const x=new XMLHttpRequest();b.disabled=true;p.hidden=false;p.value=0;"
+        "s.textContent='Uploading '+file.name+'...';x.open('POST','/update');"
+        "x.setRequestHeader('X-OTA-Password',document.querySelector('#password').value);"
+        "x.upload.onprogress=e=>{if(e.lengthComputable)p.value=e.loaded/e.total*100};"
+        "x.onload=()=>{s.textContent=x.responseText||'Server response: '+x.status;b.disabled=false};"
+        "x.onerror=()=>{s.textContent='Upload connection failed';b.disabled=false};x.send(file)});"
+        "</script></main></html>";
+
+    httpd_resp_set_type(request, "text/html; charset=utf-8");
+    httpd_resp_set_hdr(request, "Cache-Control", "no-store");
+    return httpd_resp_send(request, page, HTTPD_RESP_USE_STRLEN);
+}
+
+static esp_err_t ota_upload_handler(httpd_req_t *request)
+{
+    char supplied_password[64];
+    const size_t password_length = strlen(CONFIG_CLOCK_OTA_PASSWORD);
+    if (password_length < 8 || password_length >= sizeof(supplied_password) ||
+        httpd_req_get_hdr_value_len(request, "X-OTA-Password") != password_length ||
+        httpd_req_get_hdr_value_str(request, "X-OTA-Password", supplied_password,
+                                    sizeof(supplied_password)) != ESP_OK ||
+        strcmp(supplied_password, CONFIG_CLOCK_OTA_PASSWORD) != 0) {
+        httpd_resp_send_err(request, HTTPD_401_UNAUTHORIZED, "Invalid OTA password");
+        return ESP_OK;
+    }
+    if (ota_update_in_progress) {
+        httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR,
+                            "An update is already in progress");
+        return ESP_OK;
+    }
+    ota_update_in_progress = true;
+
+    const esp_partition_t *update_partition = esp_ota_get_next_update_partition(NULL);
+    if (update_partition == NULL || request->content_len == 0 ||
+        request->content_len > update_partition->size) {
+        ota_update_in_progress = false;
+        httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "Invalid firmware size");
+        return ESP_OK;
+    }
+
+    esp_ota_handle_t ota_handle;
+    esp_err_t result = esp_ota_begin(update_partition, request->content_len, &ota_handle);
+    bool ota_started = result == ESP_OK;
+    const char *failure_stage = "OTA begin";
+    uint8_t buffer[4096];
+    size_t remaining = request->content_len;
+    if (result == ESP_OK) {
+        failure_stage = "firmware upload";
+    }
+    while (result == ESP_OK && remaining > 0) {
+        const size_t chunk_size = remaining < sizeof(buffer) ? remaining : sizeof(buffer);
+        const int received = httpd_req_recv(request, (char *)buffer, chunk_size);
+        if (received <= 0) {
+            result = received == HTTPD_SOCK_ERR_TIMEOUT ? ESP_ERR_TIMEOUT : ESP_FAIL;
+            break;
+        }
+        result = esp_ota_write(ota_handle, buffer, (size_t)received);
+        remaining -= (size_t)received;
+    }
+    if (result == ESP_OK) {
+        failure_stage = "image validation";
+        result = esp_ota_end(ota_handle);
+        ota_started = false;
+    }
+
+    esp_app_desc_t new_app;
+    if (result == ESP_OK) {
+        failure_stage = "application descriptor";
+        result = esp_ota_get_partition_description(update_partition, &new_app);
+    }
+    const esp_app_desc_t *running_app = esp_app_get_description();
+    char failure_message[160] = {0};
+    if (result == ESP_OK &&
+        strcmp(new_app.project_name, running_app->project_name) != 0) {
+        snprintf(failure_message, sizeof(failure_message),
+                 "Firmware project '%s' does not match device project '%s'",
+                 new_app.project_name, running_app->project_name);
+        result = ESP_ERR_INVALID_ARG;
+    }
+    if (result == ESP_OK) {
+        failure_stage = "boot partition selection";
+        result = esp_ota_set_boot_partition(update_partition);
+    }
+    if (ota_started) {
+        esp_ota_abort(ota_handle);
+    }
+    if (result != ESP_OK) {
+        ota_update_in_progress = false;
+        if (failure_message[0] == '\0') {
+            snprintf(failure_message, sizeof(failure_message), "%s failed: %s",
+                     failure_stage, esp_err_to_name(result));
+        }
+        ESP_LOGE(TAG, "OTA upload rejected: %s", failure_message);
+        httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, failure_message);
+        return ESP_OK;
+    }
+
+    ESP_LOGI(TAG, "Selected firmware version %s for boot", new_app.version);
+    httpd_resp_sendstr(request, "Update installed. Restarting the clock...");
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    esp_restart();
+    return ESP_OK;
+}
+
+static esp_err_t start_ota_web_server(void)
+{
+    const size_t password_length = strlen(CONFIG_CLOCK_OTA_PASSWORD);
+    if (password_length == 0) {
+        ESP_LOGI(TAG, "Browser OTA disabled; set an OTA password in menuconfig");
+        return ESP_OK;
+    }
+    if (password_length < 8 || password_length > 63) {
+        ESP_LOGE(TAG, "Browser OTA password must be 8 to 63 characters");
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+    config.stack_size = 10240;
+    esp_err_t result = httpd_start(&ota_http_server, &config);
+    if (result != ESP_OK) {
+        ESP_LOGE(TAG, "Could not start OTA web server: %s", esp_err_to_name(result));
+        return result;
+    }
+
+    static const httpd_uri_t page_uri = {
+        .uri = "/",
+        .method = HTTP_GET,
+        .handler = ota_page_handler,
+    };
+    static const httpd_uri_t upload_uri = {
+        .uri = "/update",
+        .method = HTTP_POST,
+        .handler = ota_upload_handler,
+    };
+    result = httpd_register_uri_handler(ota_http_server, &page_uri);
+    if (result == ESP_OK) {
+        result = httpd_register_uri_handler(ota_http_server, &upload_uri);
+    }
+    if (result != ESP_OK) {
+        httpd_stop(ota_http_server);
+        ota_http_server = NULL;
+        ESP_LOGE(TAG, "Could not register OTA web routes: %s", esp_err_to_name(result));
+        return result;
+    }
+
+    ESP_LOGI(TAG, "Browser OTA ready at http://<device-ip>/");
+    return ESP_OK;
+}
+
+static void mark_running_image_valid(void)
+{
+    const esp_partition_t *running_partition = esp_ota_get_running_partition();
+    esp_ota_img_states_t state;
+    if (esp_ota_get_state_partition(running_partition, &state) == ESP_OK &&
+        state == ESP_OTA_IMG_PENDING_VERIFY) {
+        const esp_err_t result = esp_ota_mark_app_valid_cancel_rollback();
+        if (result == ESP_OK) {
+            ESP_LOGI(TAG, "OTA image passed startup checks");
+        } else {
+            ESP_LOGE(TAG, "Could not mark OTA image valid: %s", esp_err_to_name(result));
+        }
+    }
 }
 
 typedef struct {
@@ -1659,6 +1870,7 @@ void app_main(void)
     ESP_LOGI(TAG, "Clock face drawn; first pixel=0x%04X, center=0x%04X",
              framebuffer[0], framebuffer[CENTER_Y * DISPLAY_WIDTH + CENTER_X]);
     flush_display();
+    mark_running_image_valid();
 
     ESP_LOGI(TAG, "Connecting to Wi-Fi SSID '%s'", CONFIG_CLOCK_WIFI_SSID);
     result = connect_wifi();
@@ -1667,6 +1879,7 @@ void app_main(void)
         return;
     }
     start_time_sync();
+    start_ota_web_server();
     if (xTaskCreate(weather_task, "weather", 8192, NULL, 4, NULL) != pdPASS) {
         ESP_LOGE(TAG, "Could not start the OpenWeatherMap task");
     }

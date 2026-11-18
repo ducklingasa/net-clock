@@ -42,4 +42,12 @@ config CLOCK_TIMEZONE
         POSIX TZ rule used by localtime(). The default is Central European
         time with daylight saving rules, as used in Hungary.
 
+config CLOCK_OTA_PASSWORD
+    string "Browser OTA password"
+    default ""
+    help
+        Password required to upload firmware through the browser page. Use
+        8 to 63 characters. The upload server uses plain HTTP, so only use it
+        on a trusted local network.
+
 endmenu

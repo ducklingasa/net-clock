@@ -54,14 +54,14 @@ in the Arduino project.
 
 ## Configure, build, and flash
 
-The board has 4 MiB of flash (verified with `esptool flash-id`). The project
-uses a custom single-application layout in `partitions.csv`: the existing
-NVS and PHY partitions keep their offsets, and the factory application spans
-`0x10000` through `0x3fffff` (4032 KiB). This layout does not provide OTA slots.
+The board has 4 MiB of flash (verified with `esptool flash-id`). The custom
+layout in `partitions.csv` provides two 1984 KiB OTA application slots, OTA
+metadata, NVS, and PHY data. Both application slots must fit the built image.
 The flash size and partition layout are set in `sdkconfig.defaults`; for an
-existing configuration, select **Serial flasher config → Flash size → 4 MB**
-and **Partition Table → Partition Table → Custom partition table CSV**, with
-`partitions.csv` as the filename.
+existing configuration, select **Serial flasher config → Flash size → 4 MB**,
+**Partition Table → Partition Table → Custom partition table CSV** with
+`partitions.csv` as the filename, and enable **Bootloader config → Application
+Rollback**.
 
 1. Install ESP-IDF 5.5 and its required tools. Open the **ESP-IDF 5.5 Command
    Prompt** (or another shell where ESP-IDF has been exported).
@@ -89,12 +89,18 @@ and **Partition Table → Partition Table → Custom partition table CSV**, with
    **POSIX timezone** defaults to Central European time with daylight-saving
    rules, matching Budaors. Changing the weather coordinates does not change
    the timezone automatically; set it separately for the chosen location.
-   Weather is reported in metric units.
+   Weather is reported in metric units. To enable browser-based OTA, set
+   **Network clock → Browser OTA password** to a password of 8 to 63
+   characters. Leave it blank to disable the upload server.
 4. Build the firmware:
 
    ```bat
    idf.py build
    ```
+
+The application version is set by the `project()` declaration in
+`CMakeLists.txt`; increment it for each release so devices running older
+firmware can distinguish and accept updates.
 
 5. Connect the board over USB, identify its serial port in Windows Device
    Manager, then flash it (replace `COM7` with the board's port):
@@ -107,6 +113,17 @@ and **Partition Table → Partition Table → Custom partition table CSV**, with
    button while starting the flash, then release it when flashing begins.
    After changing the partition layout, use the full `flash` command above,
    not `app-flash`, to write the bootloader and partition table as well.
+
+When configured, the clock starts a browser upload page on its local network.
+Open `http://<device-ip>/`, enter the password, and select the built
+`build/net_clock.bin` file. The firmware is streamed into the inactive slot;
+the image must match this project's name before the device reboots. Reinstalling
+the same version is allowed. Bootloader rollback remains enabled, and a new image is
+marked valid after the display initializes successfully. This web server uses
+plain HTTP, so upload only from a trusted local network; do not expose it to
+the internet. To upload from a terminal instead, run `python tools\ota_upload.py`;
+it prompts for the device IPv4 address and OTA password and sends
+`build/net_clock.bin`.
 
 The clock waits for Wi-Fi and NTP time before drawing its first reading.
 OpenWeatherMap is queried over HTTPS using ESP-IDF's certificate bundle. The
@@ -142,6 +159,22 @@ To render the sample 240x240 screens to `docs/screen_shot.png` and
 `docs/screen_shot_forecast.png`, run `python tools\render_screen_shot.py`. Edit
 the `main()` call parameters to change either screen, including the forecast
 datetime and its 12 hourly icon names.
+
+### Fonts
+
+Rendered size-1 digits retain their original 5x7 pixels. Larger glyphs use
+JetBrains Mono ExtraBold 2.304 for date and weather, and DSEG7 Classic Bold
+for both time sizes. The time draws a dim full-segment digit beneath the
+active white digits. Coverage masks are packed at four bits per pixel in
+`main/font.c`; no TrueType rasterizer is needed on the device.
+
+To regenerate them, install Pillow with `python -m pip install Pillow`,
+then run `python tools/render_font.py`. Use `--check` to verify the generated
+file or `--self-test` to validate without writing it. The source font is
+vendored in `tools/fonts/JetBrainsMono-ExtraBold.ttf` from the official
+[JetBrains Mono v2.304 release](https://github.com/JetBrains/JetBrainsMono/tree/v2.304),
+with its SIL Open Font License in `tools/fonts/OFL.txt`. DSEG7 Classic Bold
+and its SIL Open Font License are in `tools/fonts/`.
 
 `menuconfig` stores credentials in the local `sdkconfig` file. It is ignored
 by Git; do not commit it because Wi-Fi credentials and the weather API key are
